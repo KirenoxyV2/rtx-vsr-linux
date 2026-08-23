@@ -25,6 +25,18 @@ hand the upscaled frame back to the player/compositor.
 - [x] **Hardware gate** — [`install/check_gpu.py`](install/check_gpu.py): RTX 4090
       blessed target; Turing (20xx) flagged experimental w/ opt-in; pre-Turing
       refused. See [Hardware](#hardware).
+- [x] **Proxy core** — [`proxy/vsr_proxy.py`](proxy/vsr_proxy.py): local HTTP
+      transform service. `GET /upscale` (file source), `POST /transform` (raw
+      segment bytes — the browser-as-fetcher path, see DESIGN §9d), `/health`,
+      demo page. decode → VSR → H.264, GPU-serialized, DLPack-safe.
+- [x] **VRAM auto-downshift** — proxy picks the highest quality mode that fits
+      *live* free VRAM (ULTRA→HIGH→MEDIUM→LOW) so it coexists with a local LLM
+      instead of failing; `?strict=1` for exact-mode-or-503. DESIGN §9b.
+- [x] **Resolution policy** — output capped at 1440p (`--max-out`); sources
+      already ≥ cap pass through with zero GPU work/VRAM. DESIGN §9c.
+- [ ] **Browser extension** — rewrite/hook media fetches to `POST /transform`
+      (per-site toggle). The Server ABR pivot (§9d) makes this the integration
+      surface.
 - [ ] **M2** — GStreamer element (refreshed fork of `gst-nvmaxine`) → VLC + CLI
 - [ ] **M3** — mpv filter with keybind toggle (`--hwdec=nvidia`, zero-copy)
 - [ ] **M4** — Chromium compositor patch: post-decode hook, DMA-BUF↔CUDA
@@ -90,7 +102,8 @@ linking a proprietary library).
 
 ```
 docs/DESIGN.md        full design doc (architecture, risks, references)
-spike/                M1 benchmark harness
+proxy/vsr_proxy.py    local HTTP transform service (route B core)
+spike/                M1/M1.5 benchmark harness + probes
 gstreamer/            M2 GStreamer element
 mpv/                  M3 mpv filter
 chromium/             M4 compositor patch + interop prototype

@@ -84,6 +84,39 @@ class ContextWedged(Exception):
 # VSR quality modes (nvvfx VideoSuperRes quality levels).
 MODES = {1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "ULTRA"}
 
+# --- remote media (for /proxy) ---------------------------------------------
+YT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+         "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+def fetch_media(url, timeout=90):
+    """Download a remote media object to a temp file. Returns (path, ctype, length)."""
+    import tempfile
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": YT_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        ctype = r.headers.get("Content-Type", "application/octet-stream")
+        length = int(r.headers.get("Content-Length", 0) or 0)
+        fd, path = tempfile.mkstemp(suffix=".media")
+        with os.fdopen(fd, "wb") as f:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    return path, ctype, length
+
+
+def probe_video(path):
+    """Return (w, h) of the video track, or (0, 0) if none is decodable."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return 0, 0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return (w, h) if w and h else (0, 0)
+
 # Measured VRAM deltas from M1 (free_before - free_after during a run), at the
 # largest resolution tested per mode (1080p->4K). We use these as a per-mode
 # ceiling and scale up only for outputs larger than that reference.
@@ -296,6 +329,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        import json
         u = urlparse(self.path)
         q = parse_qs(u.query)
         try:
@@ -319,6 +353,41 @@ class Handler(BaseHTTPRequestHandler):
                     "Content-Disposition": 'inline; filename="vsr.mp4"',
                     "Accept-Ranges": "bytes",
                 })
+            elif u.path == "/proxy":
+                # Remote media (e.g. a YouTube DASH segment): fetch, apply the
+                # resolution policy, upscale if it's worth it, else pass through.
+                url = q.get("url", [None])[0]
+                mode = int(q.get("mode", ["2"])[0])
+                scale = float(q.get("scale", ["1.5"])[0])
+                strict = q.get("strict", ["0"])[0] in ("1", "true")
+                if not url:
+                    self._send(400, "missing ?url=")
+                    return
+                t0 = time.perf_counter()
+                path, ctype, length = fetch_media(url)
+                try:
+                    w, h = probe_video(path)
+                    if h >= POLICY["max_out_h"] or not w:
+                        # audio-only segment OR already high-res: serve verbatim.
+                        with open(path, "rb") as fh:
+                            data = fh.read()
+                        self._send(200, data, ctype, extra={
+                            "X-VSR-Meta": json.dumps({"passthrough": True,
+                                "in": f"{w}x{h}", "out": f"{w}x{h}",
+                                "note": "audio-only or >= cap; served as-is"}),
+                            "X-VSR-Elapsed-S": f"{time.perf_counter()-t0:.2f}"})
+                        return
+                    if not GPU["ready"]:
+                        self._send(503, "GPU not ready: %s" % GPU.get("err"))
+                        return
+                    data, meta = upscale_clip(path, mode, scale, GPU["gpu_index"], strict=strict)
+                    self._send(200, data, "video/mp4", extra={
+                        "X-VSR-Meta": json.dumps(meta),
+                        "X-VSR-Elapsed-S": f"{time.perf_counter()-t0:.2f}",
+                    })
+                finally:
+                    try: os.remove(path)
+                    except OSError: pass
             elif u.path == "/upscale":
                 if not GPU["ready"]:
                     self._send(503, "GPU not ready: %s" % GPU.get("err"))
@@ -342,6 +411,61 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, "not found")
         except InsufficientVRAM as e:
             # Graceful, actionable — NOT a crash. Tell the browser what to do.
+            self._send(503, str(e))
+        except ContextWedged as e:
+            self._send(503, str(e))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._send(500, f"error: {e}")
+
+    def do_POST(self):
+        """POST /transform — the browser is the fetcher (it holds the session the
+        server doesn't), so it hands us raw segment bytes and we transform them.
+        This is resilient to YouTube's Server ABR 403s: we never fetch, we only
+        upscale what the already-authorized client gave us. Body = media bytes;
+        query carries mode/scale/strict like /upscale."""
+        import json
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        try:
+            if u.path != "/transform":
+                self._send(404, "not found")
+                return
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length <= 0:
+                self._send(400, "empty body (POST the raw segment bytes)")
+                return
+            raw = self.rfile.read(length)
+            mode = int(q.get("mode", ["2"])[0])
+            scale = float(q.get("scale", ["1.5"])[0])
+            strict = q.get("strict", ["0"])[0] in ("1", "true")
+            import tempfile
+            fd, path = tempfile.mkstemp(suffix=".seg")
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            t0 = time.perf_counter()
+            try:
+                w, h = probe_video(path)
+                if not w or h >= POLICY["max_out_h"]:
+                    # audio-only OR already high-res: return the bytes unchanged.
+                    self._send(200, raw, "application/octet-stream", extra={
+                        "X-VSR-Meta": json.dumps({"passthrough": True,
+                            "in": f"{w}x{h}", "out": f"{w}x{h}",
+                            "note": "audio-only or >= cap; served as-is"})})
+                    return
+                if not GPU["ready"]:
+                    self._send(503, "GPU not ready: %s" % GPU.get("err"))
+                    return
+                data, meta = upscale_clip(path, mode, scale, GPU["gpu_index"], strict=strict)
+                self._send(200, data, "video/mp4", extra={
+                    "X-VSR-Meta": json.dumps(meta),
+                    "X-VSR-Elapsed-S": f"{time.perf_counter()-t0:.2f}",
+                })
+            finally:
+                try: os.remove(path)
+                except OSError: pass
+        except InsufficientVRAM as e:
             self._send(503, str(e))
         except ContextWedged as e:
             self._send(503, str(e))

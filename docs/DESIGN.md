@@ -289,6 +289,38 @@ Verified end-to-end (`spike/test_policy.py`): 720p@1.5→1080p VSR; 720p@3.0 and
 1080p@1.5 both clamped to 1440p output; a 1440p source passed through in ~0 ms
 with no VSR run. The demo page shows "pass-through · no VSR" for those.
 
+### 9d. YouTube Server ABR broke server-side fetching (found 2026-08-23) — pivot to browser-as-fetcher
+
+The original plan was "extension rewrites the `googlevideo.com` segment URL →
+proxy re-fetches it". **That no longer works.** As of this date the watch page's
+`ytInitialPlayerResponse.streamingData` contains:
+
+- **No per-format `url` fields** — each adaptive format only has metadata
+  (itag, width/height, mimeType, contentLength).
+- A single top-level **`serverAbrStreamingUrl`** (`sabr=1`) — YouTube's new
+  "Server ABR" protocol where the *server* picks and serves segments.
+
+That URL returns **HTTP 403 Forbidden to any server-side GET**, even with the
+full session cookie jar (YSC, __Secure-YNID, …) and `Range` headers. The stream
+is bound to the browser's client context in a way a local process cannot
+replicate. Server-side workarounds were also checked and failed: Android-app
+UA watch page (`ytInitialPlayerResponse = null` / gated), Innertube `/player`
+API (400 Bad Request). Conclusion: **a server cannot fetch YouTube segments.**
+
+**Architecture pivot:** the browser is the only authorized fetcher — so it stays
+the fetcher. The proxy becomes a pure **transform service**:
+
+- `POST /transform?mode=&scale=&strict=` — body = raw segment bytes (fMP4/CMAF).
+  The extension (or any client) fetches the segment with its own session, POSTs
+  the bytes to localhost, and receives VSR-processed H.264 back (or the original
+  bytes unchanged when pass-through applies: audio-only or ≥ cap). Same policy
+  stack as `/upscale`: resolution cap + VRAM auto-downshift + graceful 503.
+
+This is *more* robust than URL rewriting: it survives YouTube protocol changes
+(the browser keeps fetching natively), works per-site via the extension, and the
+proxy never needs cookies or signature handling. Verified with real bytes:
+360p segment → 1280×720 H.264 High in 1.67 s (~54 fps); 1440p → pass-through 0 ms.
+
 ## 10. References
 
 - Chromium commit 46f000a (NVIDIA VP super resolution, Windows) — the GUID + hook
