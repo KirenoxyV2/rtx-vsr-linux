@@ -46,6 +46,51 @@ GPU = {"ready": False, "err": None}
 # they must not share the CUDA context / effect state concurrently.
 GPU_LOCK = threading.Lock()
 
+# Live activity accounting — the source of truth for "is VSR actually working
+# right now?" (as opposed to raw GPU%, which LM Studio on the same card makes
+# ambiguous). A transform counts as ACTIVE while it's running or within a short
+# window after it finished, so the badge tracks real frame processing.
+STATS = {
+    "active_until": 0.0,        # monotonic deadline: active now if time < this
+    "total_transforms": 0,      # segments actually VSR-processed (not pass-through)
+    "total_frames": 0,          # frames pushed through the VSR engine
+    "last_out": None,           # e.g. "1280x720"
+    "last_mode": None,          # e.g. "MEDIUM"
+    "last_in": None,            # e.g. "640x360"
+    "last_downshifted": False,
+}
+ACTIVE_WINDOW_S = 3.0           # a transform counts as active this long after it ends
+
+
+def _record_activity(meta):
+    """Call after a successful VSR upscale so /status + the badge reflect it."""
+    with GPU_LOCK:
+        STATS["active_until"] = time.monotonic() + ACTIVE_WINDOW_S
+        STATS["total_transforms"] += 1
+        STATS["total_frames"] += int(meta.get("frames", 0))
+        STATS["last_out"] = meta.get("out")
+        STATS["last_mode"] = MODES.get(meta.get("mode"), str(meta.get("mode")))
+        STATS["last_in"] = meta.get("in")
+        STATS["last_downshifted"] = bool(meta.get("downshifted"))
+
+
+def status_snapshot():
+    """JSON-ready dict describing live VSR state."""
+    active = time.monotonic() < STATS["active_until"]
+    return {
+        "active": active,
+        "gpu_ready": GPU["ready"],
+        "gpu": GPU.get("name"),
+        "free_mb": GPU.get("free_mb"),
+        "total_mb": GPU.get("total_mb"),
+        "total_transforms": STATS["total_transforms"],
+        "total_frames": STATS["total_frames"],
+        "last_out": STATS["last_out"],
+        "last_mode": STATS["last_mode"],
+        "last_in": STATS["last_in"],
+        "downshifted": STATS["last_downshifted"],
+    }
+
 
 def _gpu_setup(gpu_index):
     import cupy as cp
@@ -350,6 +395,7 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None, strict=False):
         "frames": n, "fps": round(src_fps, 2),
         "bytes": len(data), "gpu": GPU["name"],
     }
+    _record_activity(meta)   # single funnel: every real VSR upscale is counted once
     return data, meta
 
 
@@ -384,6 +430,16 @@ class Handler(BaseHTTPRequestHandler):
                         "free_mb": GPU.get("free_mb"), "total_mb": GPU.get("total_mb"),
                         "err": GPU.get("err")}
                 self._send(200, json.dumps(body), "application/json")
+            elif u.path == "/status":
+                # Machine-readable live state: is VSR actively processing right now?
+                self._send(200, json.dumps(status_snapshot()), "application/json",
+                           extra={"Cache-Control": "no-store"})
+            elif u.path == "/badge":
+                # Live activation indicator (the Windows-style badge). Keep this
+                # tab open; it polls /status and lights up only when VSR is
+                # actually processing frames — not on raw GPU%.
+                self._send(200, BADGE_HTML, "text/html; charset=utf-8",
+                           extra={"Cache-Control": "no-store"})
             elif u.path == "/":
                 self._send(200, INDEX_HTML, "text/html; charset=utf-8")
             elif u.path == "/play":
@@ -518,6 +574,98 @@ class Handler(BaseHTTPRequestHandler):
             import traceback
             traceback.print_exc()
             self._send(500, f"error: {e}")
+
+
+BADGE_HTML = """<!doctype html><html><head><meta charset=utf-8>
+<title>VSR Status</title>
+<style>
+ :root{--fg:#e8eaed;--muted:#9aa0a6;--accent:#7c5cff;--border:rgba(255,255,255,.14);
+       --card:rgba(22,25,33,.72);--ok:#38d39f;--warn:#ffb454}
+ *{box-sizing:border-box}
+ body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+   font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:var(--fg);
+   background:radial-gradient(120% 120% at 30% 10%,#1a1e2b 0%,#0d0f16 70%)}
+ .badge{position:relative;width:min(420px,92vw);padding:22px 24px;border-radius:18px;
+   background:var(--card);border:1px solid var(--border);backdrop-filter:blur(14px);
+   box-shadow:0 18px 50px rgba(0,0,0,.5);transition:box-shadow .25s,border-color .25s}
+ .badge.active{border-color:rgba(56,211,159,.6);
+   box-shadow:0 0 0 1px rgba(56,211,159,.35),0 0 42px rgba(56,211,159,.35),0 18px 50px rgba(0,0,0,.5)}
+ .top{display:flex;align-items:center;gap:14px}
+ .dot{width:16px;height:16px;border-radius:50%;background:#4a5060;flex:none;
+   transition:background .2s,box-shadow .2s}
+ .badge.active .dot{background:var(--ok);box-shadow:0 0 0 5px rgba(56,211,159,.18),0 0 18px var(--ok)}
+ .state{font-size:22px;font-weight:700;letter-spacing:.4px}
+ .badge.active .state{color:var(--ok)}
+ .sub{margin-left:auto;font-size:12px;color:var(--muted);text-align:right;line-height:1.5}
+ .flow{margin-top:18px;padding:14px;border-radius:12px;background:rgba(0,0,0,.28);
+   border:1px solid var(--border);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+   font-size:15px;display:flex;align-items:center;gap:10px}
+ .flow .dim{color:var(--muted)}
+ .arrow{color:var(--accent);font-weight:700}
+ .tag{margin-left:auto;font-size:12px;padding:3px 9px;border-radius:20px;
+   background:rgba(124,92,255,.18);color:#b6a6ff;border:1px solid rgba(124,92,255,.35)}
+ .tag.down{background:rgba(255,180,84,.15);color:var(--warn);border-color:rgba(255,180,84,.4)}
+ .grid{display:flex;gap:10px;margin-top:16px}
+ .cell{flex:1;background:rgba(0,0,0,.22);border:1px solid var(--border);border-radius:10px;
+   padding:10px 12px;text-align:center}
+ .cell b{display:block;font-size:19px;font-variant-numeric:tabular-nums}
+ .cell span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+ .note{margin-top:14px;font-size:12px;color:var(--muted);line-height:1.5}
+ .idle-flow{color:var(--muted);font-size:13px}
+</style></head><body>
+<div class="badge" id="b">
+  <div class="top">
+    <div class="dot"></div>
+    <div class="state" id="state">IDLE</div>
+    <div class="sub" id="gpu">connecting…</div>
+  </div>
+  <div class="flow" id="flow"><span class="idle-flow">Waiting for VSR to process a segment…</span></div>
+  <div class="grid">
+    <div class="cell"><b id="t">0</b><span>segments</span></div>
+    <div class="cell"><b id="f">0</b><span>frames</span></div>
+    <div class="cell"><b id="m">—</b><span>VRAM free</span></div>
+  </div>
+  <div class="note" id="note"></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let wasActive=false;
+async function tick(){
+  let s;
+  try{ s=await (await fetch('/status',{cache:'no-store'})).json(); }
+  catch(e){ $('state').textContent='OFFLINE'; $('b').classList.remove('active'); return; }
+  const b=$('b');
+  if(s.active){
+    b.classList.add('active');
+    $('state').textContent='VSR ACTIVE';
+    $('flow').innerHTML = s.last_in? `
+      <span class="dim">${s.last_in}</span><span class="arrow">→</span>
+      <span>${s.last_out||''}</span>
+      <span class="tag${s.downshifted?' down':''}">${s.last_mode||''}${s.downshifted?' ⚠':''}</span>`
+      : '<span class="idle-flow">processing…</span>';
+    $('note').textContent = s.downshifted
+      ? 'Auto-downshifted to fit free VRAM (an LLM is sharing the GPU).' : '';
+  } else {
+    b.classList.remove('active');
+    $('state').textContent = s.gpu_ready ? 'IDLE' : 'GPU NOT READY';
+    if(wasActive && s.last_in){
+      $('flow').innerHTML = `<span class="dim">${s.last_in}</span><span class="arrow">→</span>
+        <span>${s.last_out||''}</span>
+        <span class="tag${s.downshifted?' down':''}">${s.last_mode||''}${s.downshifted?' ⚠':''}</span>`;
+    } else {
+      $('flow').innerHTML = '<span class="idle-flow">Waiting for VSR to process a segment…</span>';
+    }
+    $('note').textContent='';
+  }
+  wasActive=s.active;
+  $('t').textContent=s.total_transforms;
+  $('f').textContent=s.total_frames.toLocaleString();
+  $('m').textContent = s.free_mb!=null ? (s.free_mb/1024).toFixed(1)+' GB' : '—';
+  $('gpu').textContent = s.gpu||'' + (s.gpu_ready?` · ${(s.free_mb/1024).toFixed(1)} / ${(s.total_mb/1024).toFixed(1)} GB free`:'');
+}
+tick(); setInterval(tick,400);
+</script>
+</body></html>"""
 
 
 INDEX_HTML = """<!doctype html><html><head><meta charset=utf-8>
