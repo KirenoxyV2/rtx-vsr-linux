@@ -107,15 +107,71 @@ def fetch_media(url, timeout=90):
     return path, ctype, length
 
 
-def probe_video(path):
-    """Return (w, h) of the video track, or (0, 0) if none is decodable."""
+def video_meta(path):
+    """(w, h, fps, nframes) via PyAV (decodes H.264/HEVC/VP8/VP9/AV1), falling
+    back to cv2 if PyAV is missing or can't open the file."""
+    try:
+        import av
+        c = av.open(path)
+        v = c.streams.video[0]
+        w, h = v.width, v.height
+        fps = float(v.average_rate or 30.0)
+        n = int(v.frames or 0)
+        c.close()
+        return w, h, fps, n
+    except Exception:
+        pass
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        return 0, 0
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        return 0, 0, 30.0, 0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
+    return w, h, fps, n
+
+
+def probe_video(path):
+    """Return (w, h) of the video track, or (0, 0) if none is decodable."""
+    w, h, _fps, _n = video_meta(path)
     return (w, h) if w and h else (0, 0)
+
+
+def open_decoder(path):
+    """Decode a file into BGR uint8 HWC numpy frames. Returns (meta, frame_iter).
+    meta has {w,h,fps,codec}. PyAV first (all YouTube codecs incl. AV1), cv2 fallback."""
+    try:
+        import av
+        c = av.open(path)
+        v = c.streams.video[0]
+        fps = float(v.average_rate or 30.0)
+        w, h = v.width, v.height
+        codec = v.codec_context.name
+
+        def gen():
+            try:
+                for frame in c.decode(v):
+                    yield frame.to_ndarray(format="bgr24")
+            finally:
+                c.close()
+        return {"w": w, "h": h, "fps": fps, "codec": codec}, gen()
+    except Exception as e:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise RuntimeError(f"cannot open source: {path} (PyAV: {e})")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        def gen2():
+            try:
+                while True:
+                    ok, f = cap.read()
+                    if not ok:
+                        break
+                    yield f
+            finally:
+                cap.release()
+        return {"w": w, "h": h, "fps": fps, "codec": "cv2"}, gen2()
 
 # Measured VRAM deltas from M1 (free_before - free_after during a run), at the
 # largest resolution tested per mode (1080p->4K). We use these as a per-mode
@@ -180,11 +236,7 @@ def passthrough_clip(src_path):
     """Serve a source that needs no upscaling, verbatim (no GPU, no VRAM)."""
     with open(src_path, "rb") as f:
         data = f.read()
-    cap = cv2.VideoCapture(src_path)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
+    w, h, fps, n = video_meta(src_path)
     meta = {"src": src_path, "in": f"{w}x{h}", "out": f"{w}x{h}",
             "mode": None, "mode_requested": None, "downshifted": False,
             "passthrough": True, "scale": 1.0, "frames": n, "fps": round(fps, 2),
@@ -201,16 +253,13 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None, strict=False):
     VideoSuperRes = GPU["VideoSuperRes"]
     dev = cp.cuda.Device(gpu_index)
 
-    cap = cv2.VideoCapture(src_path)
-    if not cap.isOpened():
+    dmeta, frames = open_decoder(src_path)   # PyAV (all codecs) or cv2 fallback
+    src_w, src_h, src_fps = dmeta["w"], dmeta["h"], dmeta["fps"]
+    if not src_w:
         raise RuntimeError(f"cannot open source: {src_path}")
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     # Resolution policy: cap output height + pass through sources already big enough.
     out_w, out_h, eff_scale, passthrough = plan_output(src_w, src_h, scale)
     if passthrough:
-        cap.release()
         return passthrough_clip(src_path)
 
     # Pre-flight VRAM check + auto-downshift (before touching CUDA): never let
@@ -261,10 +310,7 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None, strict=False):
 
         n = 0
         t_start = time.perf_counter()
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        for frame in frames:
             # H2D + format to CHW float32 [0,1] RGB
             x = cp.asarray(frame[:, :, ::-1])
             x = cp.ascontiguousarray(cp.transpose(x, (2, 0, 1)).astype(cp.float32) / 255.0)
@@ -293,7 +339,6 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None, strict=False):
                 fps = n / elapsed if elapsed else 0
                 progress(n, fps)
         writer.close()
-        cap.release()
 
     with open(tmp_path, "rb") as f:
         data = f.read()

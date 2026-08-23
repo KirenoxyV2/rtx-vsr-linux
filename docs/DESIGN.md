@@ -321,6 +321,31 @@ This is *more* robust than URL rewriting: it survives YouTube protocol changes
 proxy never needs cookies or signature handling. Verified with real bytes:
 360p segment → 1280×720 H.264 High in 1.67 s (~54 fps); 1440p → pass-through 0 ms.
 
+### 9e. Codec coverage — every YouTube stream type, not just MP4 (found 2026-08-23)
+
+YouTube serves three container/codec combos: **H.264/MP4** (most non-Premium),
+**VP9/WebM**, and **AV1** (newer + all 4K). The first decoder (OpenCV `cv2`)
+handled H.264 and VP9 but has **no AV1 decoder** — an AV1 segment failed with
+`Could not find codec`. Fix: decode via **PyAV** (FFmpeg, pip wheel, no system
+ffmpeg), which decodes all of them; cv2 is kept as a fallback if PyAV can't open
+a file. The encoder side was never a problem — the bundled ffmpeg emits H.264
+High regardless of input codec.
+
+Verified through the **live `/transform`** endpoint (MEDIUM, 2×, 30 fps):
+
+| Input | Codec / container | Result | Speed |
+|---|---|---|---|
+| `seg_360p.mp4` | H.264 / MP4 | 1280×720 H.264 High ✓ | ~47 fps |
+| `test_vp9.webm` | VP9 / WebM | 1280×720 H.264 High ✓ | ~50 fps |
+| `test_av1.mp4` | **AV1** / MP4 | 1280×720 H.264 High ✓ (was failing) | ~51 fps |
+
+So the "non-MP4 YouTube stream" concern is fully covered: VP9 and AV1 both
+upscale, output is always H.264 (what browsers play back best), and sources
+already ≥ 1440p still pass through untouched. Note: a static imageio-ffmpeg
+build has no `*_cuvid` NVDEC decoders, so decode runs on CPU via PyAV — fine at
+these rates, but the natural next optimization is `av1_cuvid`/`h264_cuvid`
+hardware decode on the 4090.
+
 ## 10. References
 
 - Chromium commit 46f000a (NVIDIA VP super resolution, Windows) — the GUID + hook

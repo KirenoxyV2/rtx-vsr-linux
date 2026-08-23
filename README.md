@@ -81,7 +81,7 @@ check reads this from `nvidia-smi` and warns if the driver is too old.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install nvidia-vfx cupy-cuda12x[ctk] nvidia-curand-cu12
+pip install -r requirements.txt      # nvidia-vfx, cupy, PyAV (all YT codecs), etc.
 source spike/env.sh                  # points CUDA_PATH/LD_LIBRARY_PATH at pip deps
 .venv/bin/python spike/bench_vsr.py            # GPU 0
 .venv/bin/python spike/bench_vsr.py 1          # GPU 1
@@ -89,6 +89,11 @@ source spike/env.sh                  # points CUDA_PATH/LD_LIBRARY_PATH at pip d
 
 Requires: NVIDIA driver ≥ 570.190 (Linux), RTX GPU with Tensor Cores.
 Tested target: 2× RTX 4090, driver 595.84, CUDA 13.2.
+
+**Every YouTube stream type is supported** — the proxy decodes via PyAV
+(FFmpeg), not just MP4: H.264/MP4, VP9/WebM, and AV1 all upscale (verified
+through the live `/transform` endpoint). Output is always H.264 (what browsers
+play back best); sources already ≥ 1440p pass through untouched.
 
 ## Licensing
 
