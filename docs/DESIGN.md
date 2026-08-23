@@ -226,6 +226,27 @@ a proprietary lib). README must state this up front for collaborators.
 - **Upstream acceptance** uncertain → plan B is fork/distro patches, which is
   still a complete user-facing product.
 
+### 9a. Pitfall (hit & fixed 2026-08-23): nvvfx DLPack outputs are effect-owned views
+
+`cp.from_dlpack(sr.run(x).image)` looks innocent but is a **use-after-free**:
+`sr.run(x)` returns a result object whose `.image` DLPack capsule references GPU
+memory *owned by that result/effect*. If you don't hold a reference to the
+result, Python frees it as soon as `from_dlpack()` returns, leaving a dangling
+view. The corruption is **sticky** — the CUDA context poisons and every later
+request in the process fails with `NvVFXError: Failed to allocate NvCVImage: an
+illegal memory access was encountered` (surfacing at the *next* effect's
+`set_output_image`, which is why it looked like a fresh allocation failure).
+
+Correct pattern (used in `proxy/vsr_proxy.py` and `spike/check_correctness.py`):
+```python
+res = sr.run(x)                      # hold the result alive
+out = cp.array(cp.from_dlpack(res.image))  # deep-copy into independent memory
+del res, x                           # now safe to release
+```
+Also serialize all GPU work with a lock (`GPU_LOCK`) — the browser fires many
+segment requests concurrently and they must not share the effect/context at once.
+A corrupted context only clears on process restart (there is no in-process reset).
+
 ## 10. References
 
 - Chromium commit 46f000a (NVIDIA VP super resolution, Windows) — the GUID + hook

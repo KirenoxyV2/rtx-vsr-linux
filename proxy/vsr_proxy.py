@@ -42,6 +42,9 @@ import numpy as np
 
 # GPU deps imported lazily per-request-ish so /health works even if CUDA is wedged.
 GPU = {"ready": False, "err": None}
+# Serialize GPU work: the browser fires multiple segment requests at once and
+# they must not share the CUDA context / effect state concurrently.
+GPU_LOCK = threading.Lock()
 
 
 def _gpu_setup(gpu_index):
@@ -77,17 +80,19 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None):
     out_w = _align16(src_w * scale)
     out_h = _align16(src_h * scale)
 
-    with dev:
+    with GPU_LOCK:  # serialize all GPU work across concurrent segment requests
+      with dev:
         sr = VideoSuperRes(quality=mode, device=gpu_index)
         sr.output_width = out_w
         sr.output_height = out_h
         sr.load()
 
-        # warmup
+        # warmup (hold the result alive; clone output into independent memory)
         x_dummy = cp.random.rand(3, src_h, src_w, dtype=cp.float32)
-        _ = cp.from_dlpack(sr.run(x_dummy).image)
+        _res = sr.run(x_dummy)
+        _img = cp.array(cp.from_dlpack(_res.image))  # copy out of effect-owned buffer
         dev.synchronize()
-        del x_dummy
+        del _res, _img, x_dummy
 
         tmp_path = os.path.join("/tmp", f"vsr_out_{os.getpid()}_{int(time.time())}.mp4")
         writer = imageio_ffmpeg.write_frames(
@@ -107,10 +112,16 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None):
             # H2D + format to CHW float32 [0,1] RGB
             x = cp.asarray(frame[:, :, ::-1])
             x = cp.ascontiguousarray(cp.transpose(x, (2, 0, 1)).astype(cp.float32) / 255.0)
-            out = cp.from_dlpack(sr.run(x).image)
+            # Hold the run result alive and COPY its image into independent
+            # memory BEFORE it can be GC'd — from_dlpack() returns a view into
+            # effect-owned GPU memory; freeing the temp corrupts the context.
+            res = sr.run(x)
+            out = cp.array(cp.from_dlpack(res.image))  # .array() => deep copy
+            del res, x
             dev.synchronize()
             # D2H + normalize to BGR uint8 HWC
-            o = out.get() if isinstance(out, cp.ndarray) else np.asarray(out)
+            o = out.get()
+            del out
             if o.dtype in (np.float32, np.float16):
                 o = (o * 255.0).round().astype(np.uint8)
             else:
@@ -298,7 +309,7 @@ def main():
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"# VSR proxy on http://{args.host}:{args.port}/")
-    print(f"# GPU {args.gpu}: {GPU['name']}  ({GPU['free_mb']//1024} GB free)")
+    print(f"# GPU {args.gpu}: {GPU['name']}  ({GPU['free_mb']/1024:.2f} GB free)")
     print(f"# clips dir: {d} -> {clips}")
     try:
         srv.serve_forever()
