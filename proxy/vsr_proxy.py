@@ -64,14 +64,13 @@ def _align16(n):
 
 
 class InsufficientVRAM(Exception):
-    """Raised when free VRAM is below the estimate for a requested VSR run."""
-    def __init__(self, free_mb, need_mb, mode, out_w, out_h):
+    """Raised when no VSR mode fits in live free VRAM (or strict=1 is set)."""
+    def __init__(self, free_mb, need_mb, label):
         self.free_mb = free_mb
         self.need_mb = need_mb
         super().__init__(
-            f"not enough free VRAM: have {free_mb} MB, this run "
-            f"({MODES.get(mode, mode)} -> {out_w}x{out_h}) needs ~{need_mb} MB. "
-            f"Free some VRAM (e.g. close a local LLM server) or pick a lower quality/scale.")
+            f"not enough free VRAM: have {free_mb} MB, {label} needs ~{need_mb} MB. "
+            f"Free some VRAM (e.g. close a local LLM server) or pick a lower scale.")
 
 
 class ContextWedged(Exception):
@@ -81,6 +80,9 @@ class ContextWedged(Exception):
             "GPU context is wedged (a previous run hit an illegal memory access). "
             "Restart the proxy to recover.")
 
+
+# VSR quality modes (nvvfx VideoSuperRes quality levels).
+MODES = {1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "ULTRA"}
 
 # Measured VRAM deltas from M1 (free_before - free_after during a run), at the
 # largest resolution tested per mode (1080p->4K). We use these as a per-mode
@@ -108,8 +110,18 @@ def live_free_mb(gpu_index):
     except Exception:
         return None
 
+def choose_mode(requested_mode, free_mb, out_w, out_h):
+    """VRAM-aware auto-downshift: highest mode <= requested whose estimated
+    VRAM fits in the live free_mb. Returns None if even LOW doesn't fit."""
+    for m in sorted(MODES, reverse=True):
+        if m > requested_mode:
+            continue
+        if est_vram_mb(m, 0, 0, out_w, out_h) <= free_mb:
+            return m
+    return None
 
-def upscale_clip(src_path, mode, scale, gpu_index, progress=None):
+
+def upscale_clip(src_path, mode, scale, gpu_index, progress=None, strict=False):
     """Run a whole clip through VSR; return (mp4_bytes, meta_dict)."""
     import imageio_ffmpeg
 
@@ -126,14 +138,28 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None):
     out_w = _align16(src_w * scale)
     out_h = _align16(src_h * scale)
 
-    # Pre-flight VRAM check (before touching CUDA): fail gracefully instead of
-    # letting the VSR engine fault + poison the whole context.
+    # Pre-flight VRAM check + auto-downshift (before touching CUDA): never let
+    # the engine OOM-fault and poison the context. Pick the highest quality
+    # mode that fits in *live* free VRAM so the proxy degrades gracefully
+    # while a local LLM shares the GPU, instead of failing outright.
+    requested_mode = mode
     free_mb = live_free_mb(gpu_index)
     if free_mb is None:
         raise ContextWedged()
-    need_mb = est_vram_mb(mode, src_w, src_h, out_w, out_h)
-    if free_mb < need_mb:
-        raise InsufficientVRAM(free_mb, need_mb, mode, out_w, out_h)
+    if strict:
+        need_mb = est_vram_mb(mode, src_w, src_h, out_w, out_h)
+        if free_mb < need_mb:
+            raise InsufficientVRAM(free_mb, need_mb, f"{MODES.get(mode, mode)} -> {out_w}x{out_h}")
+    else:
+        chosen = choose_mode(mode, free_mb, out_w, out_h)
+        if chosen is None:
+            low_need = est_vram_mb(1, src_w, src_h, out_w, out_h)
+            raise InsufficientVRAM(free_mb, low_need, f"even LOW -> {out_w}x{out_h}")
+        if chosen != mode:
+            print(f"# downshift: {MODES[mode]} -> {MODES[chosen]} "
+                  f"(free {free_mb} MB of {GPU['total_mb']} MB)", file=sys.stderr, flush=True)
+        mode = chosen
+    downshifted = mode != requested_mode
 
     with GPU_LOCK:  # serialize all GPU work across concurrent segment requests
       with dev:
@@ -199,13 +225,11 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None):
     os.remove(tmp_path)
     meta = {
         "src": src_path, "in": f"{src_w}x{src_h}", "out": f"{out_w}x{out_h}",
-        "mode": mode, "scale": scale, "frames": n, "fps": round(src_fps, 2),
+        "mode": mode, "mode_requested": requested_mode, "downshifted": downshifted,
+        "scale": scale, "frames": n, "fps": round(src_fps, 2),
         "bytes": len(data), "gpu": GPU["name"],
     }
     return data, meta
-
-
-MODES = {1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "ULTRA"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -259,11 +283,12 @@ class Handler(BaseHTTPRequestHandler):
                 src = q.get("src", [None])[0]
                 mode = int(q.get("mode", ["2"])[0])
                 scale = float(q.get("scale", ["1.5"])[0])
+                strict = q.get("strict", ["0"])[0] in ("1", "true")
                 if not src or not os.path.isfile(src):
                     self._send(400, "missing/invalid ?src= (must be an existing file path)")
                     return
                 t0 = time.perf_counter()
-                data, meta = upscale_clip(src, mode, scale, GPU["gpu_index"])
+                data, meta = upscale_clip(src, mode, scale, GPU["gpu_index"], strict=strict)
                 dt = time.perf_counter() - t0
                 import json
                 self._send(200, data, "video/mp4", extra={
@@ -336,7 +361,10 @@ document.getElementById('go').onclick=async()=>{
     const blob=await r.blob();
     v.src=URL.createObjectURL(blob); v.style.display='block'; v.play().catch(()=>{});
     const ms=((performance.now()-t0)/1000).toFixed(1);
-    st.textContent='done in '+ms+'s · '+(blob.size/1048576).toFixed(1)+' MB · '+(r.headers.get('X-VSR-Meta')||'');
+    const m=JSON.parse(r.headers.get('X-VSR-Meta')||'{}');
+    const MN={1:'LOW',2:'MEDIUM',3:'HIGH',4:'ULTRA'};
+    const q=m.downshifted?('⚠ '+MN[m.mode_requested]+' requested → '+MN[m.mode]+' used (VRAM) · '):'';
+    st.textContent='done in '+ms+'s · '+(blob.size/1048576).toFixed(1)+' MB · '+(m.in||'')+'→'+(m.out||'')+' · '+q+MN[m.mode];
   }catch(e){st.textContent='error: '+e;st.className='meta err';}
   btn.disabled=false;
 };

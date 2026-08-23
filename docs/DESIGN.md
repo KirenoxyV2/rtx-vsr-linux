@@ -215,10 +215,11 @@ a proprietary lib). README must state this up front for collaborators.
   wheel `nvidia-vfx` 0.1.0.1 runs on consumer RTX 4090 / driver 595.84 with
   no NGC key; see `spike/results_m1.txt`. Remaining caveat is the official
   "server-side only" support statement — treat SDK updates as unpinned.
-- **VRAM headroom** — *measured (M1)*: engine + buffers cost ~0.2–0.6 GB extra
+- **VRAM headroom** — *measured (M1)*: engine + buffers cost ~0.2–0.9 GB extra
   depending on mode/resolution. On this host both GPUs run LM Studio at
-  ~22–24 GB/24 GB, so VSR needs the local model unloaded or a lighter one;
-  not a problem on a typical desktop (a few GB free is normal).
+  ~22–24 GB/24 GB, so VSR shares VRAM with the local LLM **by design**: the
+  proxy auto-downshifts quality to fit live free VRAM (see §9b) instead of
+  requiring the model to be unloaded.
 - **Chromium interop risk** (DMA-BUF↔CUDA export direction is the unproven
   leg) — de-risk with a standalone prototype in M2 before touching Chromium.
 - **Model drift:** NVIDIA ships model updates inside driver/SDK releases; pin
@@ -246,6 +247,30 @@ del res, x                           # now safe to release
 Also serialize all GPU work with a lock (`GPU_LOCK`) — the browser fires many
 segment requests concurrently and they must not share the effect/context at once.
 A corrupted context only clears on process restart (there is no in-process reset).
+
+### 9b. VRAM-aware auto-downshift (added 2026-08-23)
+
+This host runs LM Studio on the same GPU as VSR, so "not enough VRAM" is the
+*normal* state, not an error. The proxy therefore never hard-fails on a mode
+that doesn't fit — it **cascades down** to the highest quality that does.
+
+- `est_vram_mb(mode, out_w, out_h)` — per-mode estimate from M1 measured deltas
+  (LOW ~0.2 GB … ULTRA ~0.9 GB at 4K) scaled by output megapixels above the
+  reference, +30% safety factor +150 MB process headroom.
+- `choose_mode(requested, free_mb, out_w, out_h)` — walks modes from `requested`
+  down to LOW, returns the first whose estimate ≤ live free VRAM (via
+  `cupy memGetInfo`), or `None` if even LOW won't fit.
+- On a downshift the proxy logs `# downshift: ULTRA -> MEDIUM (free … MB)` and
+  tags the response meta with `mode_requested`, `mode`, `downshifted=true`; the
+  demo page shows "⚠ ULTRA requested → MEDIUM used (VRAM)".
+- `?strict=1` opts out: exact mode or a clean **503** with an actionable message
+  ("free some VRAM / lower the scale"). Default is auto-downshift.
+
+Verified end-to-end (`spike/test_downshift.py`, forced free-VRAM values):
+free 5000 MB → MEDIUM as requested; free 500 MB → downshifted to LOW (valid
+output); free 300 MB → 503 "even LOW needs ~410 MB". A live ULTRA@2160p request
+that previously OOM-faulted and bricked the context now returns valid 4K H.264
+when VRAM allows, or degrades when it doesn't — never a poisoned context.
 
 ## 10. References
 
