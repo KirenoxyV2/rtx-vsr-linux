@@ -121,6 +121,45 @@ def choose_mode(requested_mode, free_mb, out_w, out_h):
     return None
 
 
+# Resolution policy (set in main() from CLI). VSR shines on 360p-1080p sources;
+# a source already at/above the cap doesn't need AI help and would just burn
+# VRAM the local LLM wants. So: never generate output taller than MAX_OUT_H,
+# and pass through (serve as-is, zero GPU work) any source already >= that.
+POLICY = {"max_out_h": 1440}
+
+
+def plan_output(src_w, src_h, scale):
+    """Apply the resolution policy. Returns (out_w, out_h, eff_scale, passthrough).
+    passthrough=True means the source is already at/above the cap: serve it as-is."""
+    cap = POLICY["max_out_h"]
+    if src_h >= cap:
+        return src_w, src_h, 1.0, True
+    out_h = _align16(src_h * scale)
+    eff_scale = scale
+    if out_h > cap:                       # requested upscale overshoots the cap
+        eff_scale = cap / src_h
+        out_h = _align16(cap)
+    out_w = _align16(src_w * eff_scale)
+    return out_w, out_h, eff_scale, False
+
+
+def passthrough_clip(src_path):
+    """Serve a source that needs no upscaling, verbatim (no GPU, no VRAM)."""
+    with open(src_path, "rb") as f:
+        data = f.read()
+    cap = cv2.VideoCapture(src_path)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    meta = {"src": src_path, "in": f"{w}x{h}", "out": f"{w}x{h}",
+            "mode": None, "mode_requested": None, "downshifted": False,
+            "passthrough": True, "scale": 1.0, "frames": n, "fps": round(fps, 2),
+            "bytes": len(data), "gpu": GPU.get("name"),
+            "note": f"source already >= {POLICY['max_out_h']}p; served as-is (no VSR)"}
+    return data, meta
+
+
 def upscale_clip(src_path, mode, scale, gpu_index, progress=None, strict=False):
     """Run a whole clip through VSR; return (mp4_bytes, meta_dict)."""
     import imageio_ffmpeg
@@ -135,8 +174,11 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None, strict=False):
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out_w = _align16(src_w * scale)
-    out_h = _align16(src_h * scale)
+    # Resolution policy: cap output height + pass through sources already big enough.
+    out_w, out_h, eff_scale, passthrough = plan_output(src_w, src_h, scale)
+    if passthrough:
+        cap.release()
+        return passthrough_clip(src_path)
 
     # Pre-flight VRAM check + auto-downshift (before touching CUDA): never let
     # the engine OOM-fault and poison the context. Pick the highest quality
@@ -226,7 +268,8 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None, strict=False):
     meta = {
         "src": src_path, "in": f"{src_w}x{src_h}", "out": f"{out_w}x{out_h}",
         "mode": mode, "mode_requested": requested_mode, "downshifted": downshifted,
-        "scale": scale, "frames": n, "fps": round(src_fps, 2),
+        "passthrough": False, "scale": round(eff_scale, 3),
+        "frames": n, "fps": round(src_fps, 2),
         "bytes": len(data), "gpu": GPU["name"],
     }
     return data, meta
@@ -363,8 +406,11 @@ document.getElementById('go').onclick=async()=>{
     const ms=((performance.now()-t0)/1000).toFixed(1);
     const m=JSON.parse(r.headers.get('X-VSR-Meta')||'{}');
     const MN={1:'LOW',2:'MEDIUM',3:'HIGH',4:'ULTRA'};
-    const q=m.downshifted?('⚠ '+MN[m.mode_requested]+' requested → '+MN[m.mode]+' used (VRAM) · '):'';
-    st.textContent='done in '+ms+'s · '+(blob.size/1048576).toFixed(1)+' MB · '+(m.in||'')+'→'+(m.out||'')+' · '+q+MN[m.mode];
+    let tail;
+    if(m.passthrough){tail='pass-through · no VSR (source already high-res)';}
+    else{const q=m.downshifted?('⚠ '+MN[m.mode_requested]+' requested → '+MN[m.mode]+' used (VRAM) · '):'';
+         tail=q+MN[m.mode]+' ×'+(m.scale||'');}
+    st.textContent='done in '+ms+'s · '+(blob.size/1048576).toFixed(1)+' MB · '+(m.in||'')+'→'+(m.out||'')+' · '+tail;
   }catch(e){st.textContent='error: '+e;st.className='meta err';}
   btn.disabled=false;
 };
@@ -377,8 +423,11 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--gpu", type=int, default=int(os.environ.get("VSR_GPU", "0")))
     ap.add_argument("--clips-dir", default=os.environ.get("VSR_CLIPS_DIR", os.path.expanduser("~/VSR/spike")))
+    ap.add_argument("--max-out", type=int, default=1440,
+                    help="cap output height in px; sources already at/above this pass through un-upscaled (default 1440)")
     args = ap.parse_args()
 
+    POLICY["max_out_h"] = args.max_out
     _gpu_setup(args.gpu)
 
     # build clip list for the demo page
@@ -398,6 +447,7 @@ def main():
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"# VSR proxy on http://{args.host}:{args.port}/")
     print(f"# GPU {args.gpu}: {GPU['name']}  ({GPU['free_mb']/1024:.2f} GB free)")
+    print(f"# policy: output capped at {POLICY['max_out_h']}p; sources >= that pass through (no VSR)")
     print(f"# clips dir: {d} -> {clips}")
     try:
         srv.serve_forever()

@@ -272,6 +272,23 @@ output); free 300 MB → 503 "even LOW needs ~410 MB". A live ULTRA@2160p reques
 that previously OOM-faulted and bricked the context now returns valid 4K H.264
 when VRAM allows, or degrades when it doesn't — never a poisoned context.
 
+### 9c. Resolution policy (added 2026-08-23)
+
+VSR earns its keep on 360p–1080p sources; a stream already at/above display
+resolution needs no AI help and would only spend VRAM the local LLM wants. The
+host display is 2560×1440, so the policy (CLI `--max-out`, default **1440**) is:
+
+- **Cap output height** at `max_out` px. A requested scale that overshoots is
+  clamped (`plan_output` returns an effective scale), so 720p@3× → 2160p request
+  becomes a 1440p output, never more.
+- **Pass through** any source whose height is already ≥ `max_out`: served
+  verbatim with zero GPU work and zero VRAM (`passthrough_clip`), tagged
+  `passthrough=true` in the meta.
+
+Verified end-to-end (`spike/test_policy.py`): 720p@1.5→1080p VSR; 720p@3.0 and
+1080p@1.5 both clamped to 1440p output; a 1440p source passed through in ~0 ms
+with no VSR run. The demo page shows "pass-through · no VSR" for those.
+
 ## 10. References
 
 - Chromium commit 46f000a (NVIDIA VP super resolution, Windows) — the GUID + hook
