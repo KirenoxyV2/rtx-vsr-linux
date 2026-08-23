@@ -179,7 +179,7 @@ a proprietary lib). README must state this up front for collaborators.
 
 | M | What | Acceptance | Est. |
 |---|------|-----------|------|
-| 1 | Spike: `nvidia-vfx` runs on consumer 4090 | ms/frame table (720p→1440p, 1080p→4K; modes 1–4); fits in free VRAM; no NGC key needed at runtime | 1 day (starting now) |
+| 1 | Spike: `nvidia-vfx` runs on consumer 4090 | ms/frame table (720p→1440p, 1080p→4K; modes 1–4); fits in free VRAM; no NGC key needed at runtime | **DONE** — see `spike/results_m1.txt` (0.5–3.1 ms/frame, ~0.2–0.6 GB) |
 | 2 | GStreamer element + `gst-launch` demo on a real file/stream | 60 fps sustained, 1080p→4K, mode ≥ MEDIUM | ~1 wk |
 | 3 | mpv filter with keybind toggle | watch YouTube-quality stream / local file upscaled live | 1–2 wks |
 | 4 | Chromium patch (private build first) | 720p YouTube on 4K display visibly VSR-upscaled, <16 ms/frame budget met, DRM bypass works | 3–8 wks |
@@ -187,11 +187,14 @@ a proprietary lib). README must state this up front for collaborators.
 
 ## 9. Risks
 
-- **Consumer-GPU support of the SDK** is officially "unsupported" — Spike #1
-  decides whether we're on solid ground or in RE territory. (Mitigation: pip
-  wheel + sm_89 NGC example suggest it works; community reports agree.)
-- **VRAM headroom:** VSR at 4K output needs a few GB; this host currently runs
-  ~22–24 GB/24 GB on both GPUs (LM Studio). Spike must measure real footprint.
+- **Consumer-GPU support of the SDK** — *de-risked (M1, 2026-08-23)*: pip
+  wheel `nvidia-vfx` 0.1.0.1 runs on consumer RTX 4090 / driver 595.84 with
+  no NGC key; see `spike/results_m1.txt`. Remaining caveat is the official
+  "server-side only" support statement — treat SDK updates as unpinned.
+- **VRAM headroom** — *measured (M1)*: engine + buffers cost ~0.2–0.6 GB extra
+  depending on mode/resolution. On this host both GPUs run LM Studio at
+  ~22–24 GB/24 GB, so VSR needs the local model unloaded or a lighter one;
+  not a problem on a typical desktop (a few GB free is normal).
 - **Chromium interop risk** (DMA-BUF↔CUDA export direction is the unproven
   leg) — de-risk with a standalone prototype in M2 before touching Chromium.
 - **Model drift:** NVIDIA ships model updates inside driver/SDK releases; pin

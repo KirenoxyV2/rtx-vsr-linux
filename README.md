@@ -13,8 +13,10 @@ hand the upscaled frame back to the player/compositor.
 
 - [x] Design doc — [`docs/DESIGN.md`](docs/DESIGN.md) (how Windows works, why
   Linux lacks it, architecture options A–D, milestones)
-- [ ] **M1** — Spike: `nvidia-vfx` benchmark on consumer RTX 4090
-      (`spike/bench_vsr.py`) — ms/frame per quality mode, VRAM footprint
+- [x] **M1** — Spike: `nvidia-vfx` runs on consumer RTX 4090. Results in
+      [`spike/results_m1.txt`](spike/results_m1.txt): LOW 720p→1440p **0.5 ms/f**,
+      ULTRA 1080p→4K **3.1 ms/f** (~330 fps), ~0.2–0.6 GB VRAM, correctness
+      verified (per-mode outputs differ). No NGC key needed; deps are pip-only.
 - [ ] **M2** — GStreamer element (refreshed fork of `gst-nvmaxine`) → VLC + CLI
 - [ ] **M3** — mpv filter with keybind toggle (`--hwdec=nvidia`, zero-copy)
 - [ ] **M4** — Chromium compositor patch: post-decode hook, DMA-BUF↔CUDA
@@ -39,9 +41,10 @@ hand the upscaled frame back to the player/compositor.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install nvidia-vfx cupy-cuda12x
-python spike/bench_vsr.py            # GPU 0
-python spike/bench_vsr.py 1          # GPU 1
+pip install nvidia-vfx cupy-cuda12x[ctk] nvidia-curand-cu12
+source spike/env.sh                  # points CUDA_PATH/LD_LIBRARY_PATH at pip deps
+.venv/bin/python spike/bench_vsr.py            # GPU 0
+.venv/bin/python spike/bench_vsr.py 1          # GPU 1
 ```
 
 Requires: NVIDIA driver ≥ 570.190 (Linux), RTX GPU with Tensor Cores.

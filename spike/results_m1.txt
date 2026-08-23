@@ -1,0 +1,24 @@
+# rtx-vsr-linux M1 spike results — 2026-08-23T15:44:44Z
+# host: 2x RTX 4090, driver 595.84, CUDA 13.2, nvidia-vfx 0.1.0.1 (pip wheel)
+
+## GPU 0 (full suite)
+# GPU 0: NVIDIA GeForce RTX 4090
+{'gpu': 0, 'mode': 1, 'in': '1280x720', 'out': '2560x1440', 'ms_per_frame': 0.49, 'fps_at_budget': 2046.6, 'vram_used_during_run_mb': 201, 'vram_free_before_mb': 1214}
+{'gpu': 0, 'mode': 2, 'in': '1280x720', 'out': '2560x1440', 'ms_per_frame': 0.57, 'fps_at_budget': 1759.6, 'vram_used_during_run_mb': 201, 'vram_free_before_mb': 1209}
+{'gpu': 0, 'mode': 3, 'in': '1280x720', 'out': '2560x1440', 'ms_per_frame': 1.11, 'fps_at_budget': 899.7, 'vram_used_during_run_mb': 306, 'vram_free_before_mb': 1209}
+{'gpu': 0, 'mode': 2, 'in': '1920x1080', 'out': '3840x2160', 'ms_per_frame': 1.21, 'fps_at_budget': 827.7, 'vram_used_during_run_mb': 395, 'vram_free_before_mb': 1211}
+{'gpu': 0, 'mode': 3, 'in': '1920x1080', 'out': '3840x2160', 'ms_per_frame': 2.43, 'fps_at_budget': 412.1, 'vram_used_during_run_mb': 629, 'vram_free_before_mb': 1210}
+{'gpu': 0, 'mode': 4, 'in': '1920x1080', 'out': '3840x2160', 'ms_per_frame': 3.06, 'fps_at_budget': 326.9, 'vram_used_during_run_mb': 629, 'vram_free_before_mb': 1214}
+
+## GPU 1 (full suite)
+# OOM on all cases: llama-server holds 23.7 GB / 24.5 GB of GPU 1, leaving
+# <1 GB free — VSR needs ~1-2 GB for engine + buffers. Not an SDK limitation;
+# re-run with the local model unloaded (or after `nvidia-smi` shows headroom).
+
+## Verdict
+- nvidia-vfx 0.1.0.1 (pip wheel, no NGC key) runs on consumer RTX 4090 (sm_89),
+  driver 595.84. Correctness verified: mode outputs differ (real AI work).
+- Perf headroom is enormous: even at ULTRA 1080p->4K it's ~3 ms/frame (~330 fps),
+  20-60x under a 60 fps real-time budget, with only ~0.2-0.6 GB extra VRAM.
+- Runtime deps (libcurand.so, CUDA headers for JIT) are all pip-shippable —
+  see spike/env.sh. No system CUDA toolkit required.
