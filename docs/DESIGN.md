@@ -81,6 +81,28 @@ Related prior art:
 - Intel VP Super Resolution is upstreamed in Chromium (`kIntelVpSuperResolution`)
   — precedent that Google accepts vendor video-enhancement hooks.
 
+### 4a. Hardware support matrix (what we bless vs. what we warn about)
+
+Official VFX support starts at **Ampere (RTX 30xx, sm_8x)**. We target the
+**RTX 4090 (sm_89)** as the reference and gate every entry point on
+`install/check_gpu.py`, which classifies each GPU from `nvidia-smi`:
+
+| Tier | Compute cap | Cards | Gate verdict / exit | Behavior |
+|------|-------------|-------|---------------------|----------|
+| Supported | sm_8x+ (Ampere, Ada) | 30xx, 40xx (4090 ref) | `supported` / 0 | Normal install & run. |
+| Experimental | sm_75 (Turing) | 20xx (e.g. 2060) | `experimental` / 10 | Runs, but thermally constrained — sustained VSR load gets these hot. Requires explicit opt-in flag before proceeding. |
+| Unsupported | < sm_75, no NVIDIA GPU, or driver below min | GTX 10xx and older | `unsupported` / 20 | Refused with a clear message; point at the driver/GPU requirement. |
+
+Driver floor: **≥ 570.190 / 580.82 / 590.44** (verified host runs 595.84). The
+check parses `nvidia-smi` for both compute capability and driver branch, so a
+too-old driver on an otherwise-fine card is caught at install time, not at the
+first OOM or missing-kernel error.
+
+Rationale: we would rather fail fast with an honest "experimental / thermal
+risk" notice than let a Turing card cook itself under a sustained 4K upscale
+loop and have that blamed on the project. The gate is the single source of
+truth for "is this machine allowed in."
+
 ## 5. Architecture options (ranked)
 
 ### A. Chromium compositor patch — the real goal (hard)
@@ -167,7 +189,8 @@ rtx-vsr-linux/
 ├── mpv/vsr-mpv/              ← M3: mpv filter using vsr-glue
 ├── chromium/patches/         ← M4: feature flag + post-decode hook + interop
 ├── benchmarks/               ← ms/frame tables per mode/resolution; A/B screenshots
-└── install/                  ← SDK fetch scripts (NGC), driver checks, CI matrix
+├── install/                  ← SDK fetch scripts (NGC), driver checks, CI matrix
+│   └── check_gpu.py          ← hardware gate: supported/experimental/unsupported
 ```
 
 Licensing: our code MIT. The VFX SDK + models are NVIDIA-proprietary (NGC

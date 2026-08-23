@@ -37,6 +37,26 @@ hand the upscaled frame back to the player/compositor.
    Windows driver did for free. Every primitive has in-tree precedent in
    Chromium; no reverse engineering needed on the happy path.
 
+## Hardware
+
+**Blessed target: RTX 4090 (sm_89, Ada).** That is what this project is built
+and tested against — treat it as the reference. The proxy gates on a hardware
+check at install/startup (`install/check_gpu.py`, exit code + JSON verdict):
+
+| Tier | Cards | Verdict | Notes |
+|------|-------|---------|-------|
+| **Supported** | RTX 30xx (Ampere, sm_8x) and newer — incl. 4090 | `supported` (exit 0) | Blessed path. Official VFX support is Ampere+. |
+| **Experimental** | Turing — RTX 20xx (sm_75), e.g. 2060 | `experimental` (exit 10) | VSR *runs* but these cards are thermally constrained and get hot under sustained load. Requires explicit opt-in (`--i-know-what-im-doing`). |
+| **Unsupported** | Pre-Turing, no NVIDIA GPU, or driver below minimum | `unsupported` (exit 20) | Refused with a clear message. |
+
+Driver requirement: **≥ 570.190 / 580.82 / 590.44** (we run 595.84). The
+check reads this from `nvidia-smi` and warns if the driver is too old.
+
+> **Why not just say "any NVIDIA card"?** Official VFX support starts at
+> Ampere (RTX 30xx). Turing works but is a thermal gamble, and anything older
+> lacks the Tensor Core features the model relies on. We'd rather be explicit
+> than have someone's 2060 cook itself and blame us.
+
 ## Quickstart (spike)
 
 ```bash
