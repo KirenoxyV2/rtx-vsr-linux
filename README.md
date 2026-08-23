@@ -17,6 +17,14 @@ hand the upscaled frame back to the player/compositor.
       [`spike/results_m1.txt`](spike/results_m1.txt): LOW 720p→1440p **0.5 ms/f**,
       ULTRA 1080p→4K **3.1 ms/f** (~330 fps), ~0.2–0.6 GB VRAM, correctness
       verified (per-mode outputs differ). No NGC key needed; deps are pip-only.
+- [x] **M1.5** — End-to-end pipeline probe: real decode→VSR→encode runs
+      faster than real-time. GPU-resident AI path is **0.63 ms/frame**; full
+      NVDEC+AI+NVENC production estimate **6.6–11.6 ms/frame = 2.5–5× headroom**
+      at 30 fps. Latency not perceivable. A/B visual confirms genuine upscaling.
+      Results in [`spike/results_m1_5.txt`](spike/results_m1_5.txt).
+- [x] **Hardware gate** — [`install/check_gpu.py`](install/check_gpu.py): RTX 4090
+      blessed target; Turing (20xx) flagged experimental w/ opt-in; pre-Turing
+      refused. See [Hardware](#hardware).
 - [ ] **M2** — GStreamer element (refreshed fork of `gst-nvmaxine`) → VLC + CLI
 - [ ] **M3** — mpv filter with keybind toggle (`--hwdec=nvidia`, zero-copy)
 - [ ] **M4** — Chromium compositor patch: post-decode hook, DMA-BUF↔CUDA

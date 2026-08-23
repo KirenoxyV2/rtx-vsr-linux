@@ -18,3 +18,5 @@ nvvfx-sdk/
 # Scratch / results (keep the tables, not the dumps)
 spike/results/*.csv.tmp
 *.log
+spike/probe_out_*.mp4        # reproducible encoded output dumps (run probe_pipeline.py)
+spike/compare_mode3.png

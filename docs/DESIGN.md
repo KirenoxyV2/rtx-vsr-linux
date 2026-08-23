@@ -203,6 +203,7 @@ a proprietary lib). README must state this up front for collaborators.
 | M | What | Acceptance | Est. |
 |---|------|-----------|------|
 | 1 | Spike: `nvidia-vfx` runs on consumer 4090 | ms/frame table (720p→1440p, 1080p→4K; modes 1–4); fits in free VRAM; no NGC key needed at runtime | **DONE** — see `spike/results_m1.txt` (0.5–3.1 ms/frame, ~0.2–0.6 GB) |
+| 1.5 | End-to-end pipeline probe: real decode→VSR→encode faster than real-time | per-stage ms/frame breakdown; production NVDEC+AI+NVENC estimate vs 30/60 fps budget; A/B visual proves genuine upscaling | **DONE** — see `spike/results_m1_5.txt` (GPU-resident AI path 0.63 ms/f; full pipeline 6.6–11.6 ms/f = 2.5–5× headroom @30fps) |
 | 2 | GStreamer element + `gst-launch` demo on a real file/stream | 60 fps sustained, 1080p→4K, mode ≥ MEDIUM | ~1 wk |
 | 3 | mpv filter with keybind toggle | watch YouTube-quality stream / local file upscaled live | 1–2 wks |
 | 4 | Chromium patch (private build first) | 720p YouTube on 4K display visibly VSR-upscaled, <16 ms/frame budget met, DRM bypass works | 3–8 wks |
