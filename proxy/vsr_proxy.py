@@ -63,6 +63,52 @@ def _align16(n):
     return max(16, int(round(n / 16.0)) * 16)
 
 
+class InsufficientVRAM(Exception):
+    """Raised when free VRAM is below the estimate for a requested VSR run."""
+    def __init__(self, free_mb, need_mb, mode, out_w, out_h):
+        self.free_mb = free_mb
+        self.need_mb = need_mb
+        super().__init__(
+            f"not enough free VRAM: have {free_mb} MB, this run "
+            f"({MODES.get(mode, mode)} -> {out_w}x{out_h}) needs ~{need_mb} MB. "
+            f"Free some VRAM (e.g. close a local LLM server) or pick a lower quality/scale.")
+
+
+class ContextWedged(Exception):
+    """Raised when the CUDA context is already poisoned and can't even be queried."""
+    def __init__(self):
+        super().__init__(
+            "GPU context is wedged (a previous run hit an illegal memory access). "
+            "Restart the proxy to recover.")
+
+
+# Measured VRAM deltas from M1 (free_before - free_after during a run), at the
+# largest resolution tested per mode (1080p->4K). We use these as a per-mode
+# ceiling and scale up only for outputs larger than that reference.
+_MODE_VRAM_MB = {1: 200, 2: 400, 3: 600, 4: 600}
+_REF_OUT_MP = 3840 * 2160 / 1e6  # 8.29 MP (the M1 reference output)
+
+
+def est_vram_mb(mode, in_w, in_h, out_w, out_h):
+    """Conservative VRAM estimate for a VSR run (engine + buffers), in MB."""
+    base = _MODE_VRAM_MB.get(mode, 600) * 1.3          # safety factor on measured delta
+    out_mp = (out_w * out_h) / 1e6
+    extra = max(0.0, out_mp - _REF_OUT_MP) * 72.0       # ~72 MB/MP above the reference
+    overhead = 150                                       # process + transient headroom
+    return int(base + extra + overhead)
+
+
+def live_free_mb(gpu_index):
+    """Current free VRAM on the GPU, or None if it can't be read (context wedged)."""
+    try:
+        cp = GPU["cupy"]
+        with cp.cuda.Device(gpu_index):
+            free, _total = cp.cuda.runtime.memGetInfo()
+        return free // (1024 * 1024)
+    except Exception:
+        return None
+
+
 def upscale_clip(src_path, mode, scale, gpu_index, progress=None):
     """Run a whole clip through VSR; return (mp4_bytes, meta_dict)."""
     import imageio_ffmpeg
@@ -79,6 +125,15 @@ def upscale_clip(src_path, mode, scale, gpu_index, progress=None):
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     out_w = _align16(src_w * scale)
     out_h = _align16(src_h * scale)
+
+    # Pre-flight VRAM check (before touching CUDA): fail gracefully instead of
+    # letting the VSR engine fault + poison the whole context.
+    free_mb = live_free_mb(gpu_index)
+    if free_mb is None:
+        raise ContextWedged()
+    need_mb = est_vram_mb(mode, src_w, src_h, out_w, out_h)
+    if free_mb < need_mb:
+        raise InsufficientVRAM(free_mb, need_mb, mode, out_w, out_h)
 
     with GPU_LOCK:  # serialize all GPU work across concurrent segment requests
       with dev:
@@ -217,6 +272,11 @@ class Handler(BaseHTTPRequestHandler):
                 })
             else:
                 self._send(404, "not found")
+        except InsufficientVRAM as e:
+            # Graceful, actionable — NOT a crash. Tell the browser what to do.
+            self._send(503, str(e))
+        except ContextWedged as e:
+            self._send(503, str(e))
         except Exception as e:
             import traceback
             traceback.print_exc()
