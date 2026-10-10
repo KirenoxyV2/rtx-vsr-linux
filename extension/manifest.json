@@ -1,11 +1,18 @@
 {
   "manifest_version": 3,
-  "name": "RTX VSR Local Upscaler",
-  "version": "0.2.1",
-  "description": "Upscales low-res H.264 web video (e.g. YouTube) through a local NVIDIA RTX VSR proxy. Non-DRM only; per-site toggle.",
+  "name": "RTX VSR",
+  "version": "0.3.0",
+  "description": "Sends low-resolution H.264 web video (e.g. YouTube) to the RTX VSR app on this computer for AI upscaling. Non-DRM only; per-site switch.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuIKezpqfatKyP6i52XXQkO/0l/L1/pP+HP3HjSmLchlmVg4i6kR2zuFInchoaXoGPm8sqwyBxPMOdfgoH+v7R73CUIDlgj3ikRz7mek+XCAIHeGrurGadier6mbZrDQlcV44pNLK5aXdV8zkQEFJmrUH/cOSudbciSBMsE8KdsQsLh3PPArMoHgY+TYdyDGB3fay0X/IcMeaxgd9Kh8XIC/kofgx/T4pGUj7QmQH9czbgntTa+1JF1rAtgvhXeYzV7/QfrqaBBlaZlWjdlFEp2DMQyBOqAB8vRXDwg2W85Jlyy8U86zklPZMSpSIaScPc79ZplM9k/qJy23wTTU8EwIDAQAB",
   "minimum_chrome_version": "111",
   "permissions": ["storage", "scripting", "tabs"],
   "host_permissions": ["<all_urls>"],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "background": {
     "service_worker": "background.js"
   },

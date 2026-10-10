@@ -1,13 +1,21 @@
-/* RTX VSR Local Upscaler — isolated-world bridge.
+/* RTX VSR — isolated-world bridge.
  *
  * inject.js lives in the page's world and cannot use extension APIs; the
  * page's own network rules (CSP, CORS, local-network prompts) would also apply
  * to a fetch made from there. So it hands each segment to this script with
  * window.postMessage, and this script passes it on to the service worker,
- * which talks to the proxy. Extension messages are JSON, hence base64.
+ * which talks to the app. Extension messages are JSON, hence base64.
  */
 (() => {
   "use strict";
+
+  // Two copies of the extension (say, one loaded by hand and one loaded by
+  // the app) would each relay every segment: only the first bridge answers.
+  const root = document.documentElement;
+  if (root) {
+    if (root.hasAttribute("data-rtx-vsr-bridge")) return;
+    root.setAttribute("data-rtx-vsr-bridge", "");
+  }
 
   const toB64 = (bytes) => {
     if (bytes.toBase64) return bytes.toBase64();
@@ -27,15 +35,26 @@
 
   window.addEventListener("message", (ev) => {
     const m = ev.data;
-    if (ev.source !== window || !m || m.__vsr !== "req") return;
+    if (ev.source !== window || !m) return;
+    if (m.__vsr === "cfg") {
+      // The app's settings, for the on-video indicator.
+      try {
+        chrome.runtime.sendMessage({ type: "appConfig" }, (res) => {
+          void chrome.runtime.lastError;
+          window.postMessage({ __vsr: "cfgres", config: res || null }, "*");
+        });
+      } catch (_) {}
+      return;
+    }
+    if (m.__vsr !== "req") return;
     const reply = (res, transfer) =>
       window.postMessage(Object.assign({ __vsr: "res", id: m.id }, res), "*", transfer || []);
     try {
       chrome.runtime.sendMessage(
-        { type: "transform", maxh: m.maxh, body: toB64(new Uint8Array(m.body)) },
+        { type: "transform", screen: m.screen, body: toB64(new Uint8Array(m.body)) },
         (res) => {
           if (chrome.runtime.lastError || !res || !res.ok) {
-            return reply({ ok: false, passthrough: !!(res && res.passthrough) });
+            return reply({ ok: false, passthrough: !!(res && res.passthrough), meta: res && res.meta });
           }
           const all = fromB64(res.body);
           const init = all.slice(0, res.initLen), media = all.slice(res.initLen);

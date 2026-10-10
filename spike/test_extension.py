@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
-"""End-to-end test of extension/ + proxy in a real (headless) Chromium.
+"""End-to-end test of extension/ + the app in a real (headless) Chromium.
 
 Serves a small MSE player page with a DASH stream built from the sample clip
-(640x360 H.264 with B-frames, plus audio), starts the proxy, loads the unpacked
-extension into a throwaway browser profile and checks that
+(640x360 H.264 with B-frames, plus audio), starts the app's proxy without a
+window, and starts the browser the way the app's "Connect <browser>" switch
+makes it start: with the command line of the launcher override that
+`rtx-vsr --connect` writes (into a throwaway home, so nothing of yours is
+touched). Checks that
 
+  - that command line is enough for a fresh profile to load the extension,
   - the page plays 1280x720 video (it appended 640x360),
   - the whole timeline is buffered and playback advances,
   - the page saw normal SourceBuffer behaviour (updating / updateend / abort),
   - segments arriving in arbitrary pieces work too,
-  - VP9 is reported as unsupported (codec steering), audio is untouched.
+  - VP9 is reported as unsupported (codec steering), audio is untouched,
+  - the "RTX VSR" indicator sits in the video's top right corner when the
+    app's setting is on, and is absent when it is off.
 
-Usage:  ~/vsr-venv/bin/python spike/test_extension.py [browser command ...]
-  default browser: the Vivaldi Flatpak, with a throwaway profile on disk
-  needs: uv pip install --python ~/vsr-venv websockets
+Usage:  ~/vsr-venv/bin/python spike/test_extension.py [path/to/rtx-vsr]
+  needs: the Vivaldi Flatpak (com.vivaldi.Vivaldi), a built app
+         ((cd app && cargo build --release)), and
+         uv pip install --python ~/vsr-venv websockets
 """
 import asyncio
 import functools
 import http.server
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -33,8 +41,19 @@ import websockets
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-EXT = os.path.join(REPO, "extension")
-PROXY_PORT, PAGE_PORT, CDP_PORT = 8730, 8731, 9333
+BROWSER = "com.vivaldi.Vivaldi"
+# Not the app's usual port: yours may be running.
+PROXY_PORT, PAGE_PORT, CDP_PORT = 8744, 8731, 9333
+
+
+def find_app():
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    for build in ("release", "debug"):
+        p = os.path.join(REPO, "app", "target", build, "rtx-vsr")
+        if os.path.exists(p):
+            return p
+    sys.exit("build the app first: (cd app && cargo build --release)")
 
 PAGE = r"""<!doctype html><meta charset=utf-8><title>vsr mse test</title>
 <video id=v muted playsinline></video>
@@ -110,6 +129,16 @@ PAGE = r"""<!doctype html><meta charset=utf-8><title>vsr mse test</title>
     const q2 = v.getVideoPlaybackQuality();
     R.frames = { total: q2.totalVideoFrames, dropped: q2.droppedVideoFrames };
     R.vsr = window.__vsr ? window.__vsr.status() : null;
+    // The indicator is placed by a timer; give it a moment.
+    const find = () => document.querySelector("[data-rtx-vsr-indicator]");
+    const t1 = performance.now();
+    while (q.get("mark") === "1" && !(find() && find().style.display === "flex")
+           && performance.now() - t1 < 4000) await new Promise((r) => setTimeout(r, 100));
+    const m = find();
+    R.mark = m && m.style.display === "flex" ? {
+      text: m.textContent, left: m.offsetLeft, top: m.offsetTop, side: [m.offsetWidth, m.offsetHeight],
+      video: [v.offsetLeft, v.offsetTop, v.clientWidth, v.clientHeight],
+    } : null;
   } catch (e) {
     R.errors.push(String(e && e.stack || e));
   }
@@ -197,10 +226,16 @@ async def run_page(cdp, url, timeout=120):
     return res
 
 
-def check(label, res, n, expect_vsr):
-    # The extension caps the output at the screen height (600 px headless).
-    f = min(2.0, res.get("screenH", 720) / 360) if expect_vsr else 1.0
-    want = [max(2, round(640 * f / 2) * 2), max(2, round(360 * f / 2) * 2)]
+def check(label, res, n, expect_vsr, expect_mark=False):
+    # The app upscales to its configured 1280x720 (the headless window's
+    # 800x600 screen is no display it knows, so there is no further cap).
+    want = [1280, 720] if expect_vsr else [640, 360]
+    mark = res.get("mark")
+    if mark:
+        vx, vy, vw, vh = mark["video"]
+        in_corner = (mark["text"] == "RTXVSR" and mark["side"][0] == mark["side"][1] > 20
+                     and vx + vw / 2 < mark["left"] and mark["left"] + mark["side"][0] <= vx + vw
+                     and vy <= mark["top"] < vy + vh / 4)
     checks = {
         "no errors": not res["errors"],
         f"video is {want[0]}x{want[1]}": res.get("size") == want,
@@ -214,25 +249,60 @@ def check(label, res, n, expect_vsr):
         "hook present / vp9 steered": (res.get("hooked"), res.get("vp9")) == (expect_vsr, not expect_vsr),
         "every segment transformed": not expect_vsr
                                      or (res["vsr"]["transformed"] >= n and res["vsr"]["passthrough"] == 0),
+        "indicator in the top right corner" if expect_mark else "no indicator":
+            bool(mark) and in_corner if expect_mark else not mark,
     }
     bad = [k for k, v in checks.items() if not v]
     print(f"{label}: size={res.get('size')} buffered={res.get('buffered')} "
-          f"t={res.get('currentTime')} frames={res.get('frames')} vsr={res.get('vsr')}")
+          f"t={res.get('currentTime')} frames={res.get('frames')} vsr={res.get('vsr')} mark={mark}")
     print(f"  -> {'ok' if not bad else 'FAILED: ' + ', '.join(bad)}")
     for e in res["errors"]:
         print("     error:", e)
     return not bad
 
 
+def start_app(app, config, indicator):
+    """The proxy without a window, upscaling to 1280x720."""
+    os.makedirs(os.path.join(config, "rtx-vsr"), exist_ok=True)
+    with open(os.path.join(config, "rtx-vsr", "config.json"), "w") as f:
+        json.dump({"target": [1280, 720], "quality": 2, "indicator": indicator}, f)
+    proc = subprocess.Popen([app, "--headless", "--port", str(PROXY_PORT)],
+                            env=dict(os.environ, XDG_CONFIG_HOME=config),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_http(f"http://127.0.0.1:{PROXY_PORT}/health")
+    return proc
+
+
+def connected_command(app, home):
+    """What the launcher override made by `rtx-vsr --connect` runs, as argv
+    (without the desktop-entry placeholders), and the extension directory."""
+    env = dict(os.environ, HOME=home, XDG_DATA_HOME=os.path.join(home, "data"),
+               XDG_CONFIG_HOME=os.path.join(home, "config"))
+    subprocess.run([app, "--connect", BROWSER], env=env, check=True, stdout=subprocess.DEVNULL)
+    with open(os.path.join(home, "data", "applications", BROWSER + ".desktop")) as f:
+        entry = f.read()
+    assert "X-RTX-VSR-Managed=true" in entry
+    exec_line = next(l[5:] for l in entry.splitlines() if l.startswith("Exec="))
+    argv = [a for a in shlex.split(exec_line) if a not in ("@@u", "@@", "%U", "%u", "--file-forwarding")]
+    ext = next(a.split("=", 1)[1] for a in argv if a.startswith("--load-extension="))
+    return argv, ext
+
+
 async def main():
+    app = find_app()
     site = tempfile.mkdtemp(prefix="vsr-site-")
     profile = tempfile.mkdtemp(prefix="vsr-ext-profile-")
+    home = tempfile.mkdtemp(prefix="vsr-ext-home-")
+    argv, ext = connected_command(app, home)
+    print("launcher runs:", " ".join(argv))
     # Flatpak: --die-with-parent, or the sandboxed browser outlives terminate();
-    # and the profile dir is shared in from the host, because a sandbox's own
-    # /tmp lives on the small /run/user tmpfs and a browser profile fills it.
-    browser = sys.argv[1:] or ["flatpak", "run", "--die-with-parent",
-                               f"--filesystem={EXT}:ro", f"--filesystem={profile}",
-                               "com.vivaldi.Vivaldi"]
+    # the profile dir is shared in from the host, because a sandbox's own /tmp
+    # lives on the small /run/user tmpfs and a browser profile fills it; and
+    # the extension is shared in because this test keeps it in a throwaway
+    # home instead of the browser's own data directory.
+    run = argv.index("run") + 1
+    browser = argv[:run] + ["--die-with-parent", f"--filesystem={ext}:ro",
+                            f"--filesystem={profile}"] + argv[run:]
     n, audio = make_site(site)
     print(f"test stream: {n} segments of 2 s, audio={audio}")
 
@@ -244,17 +314,14 @@ async def main():
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", PAGE_PORT), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
-    proxy = subprocess.Popen([sys.executable, os.path.join(REPO, "proxy", "vsr_proxy.py"),
-                              "--port", str(PROXY_PORT)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    config = os.path.join(home, "app-config")
+    proxy = start_app(app, config, indicator=False)
     chrome = None
     ok = False
     try:
-        wait_http(f"http://127.0.0.1:{PROXY_PORT}/health")
         chrome = subprocess.Popen(browser + [
             "--headless=new", "--no-first-run", f"--user-data-dir={profile}",
-            f"--remote-debugging-port={CDP_PORT}", f"--load-extension={EXT}",
-            "--disable-features=DisableLoadExtensionCommandLineSwitch",
+            f"--remote-debugging-port={CDP_PORT}",
             "--autoplay-policy=no-user-gesture-required",
             "--disable-background-media-suspend", "--disable-renderer-backgrounding",
             "about:blank"],
@@ -272,9 +339,10 @@ async def main():
                     break
                 await asyncio.sleep(0.25)
             if not sw:
-                print("FAIL: extension service worker not found — did the browser "
-                      "ignore --load-extension?")
+                print("FAIL: extension service worker not found — the launcher's "
+                      "command line did not make the browser load the extension")
                 return 1
+            print("extension loaded as", sw["url"].split("/")[2])
             page = f"http://127.0.0.1:{PAGE_PORT}/index.html?n={n}&audio={int(audio)}"
 
             # 1. site not enabled: nothing may change
@@ -284,18 +352,24 @@ async def main():
                     break
                 await asyncio.sleep(0.25)
             await cdp.evaluate(s, "syncScripts()")
-            ok = check("control (site off)   ", await run_page(cdp, page), n, False)
+            ok = check("control (site off)       ", await run_page(cdp, page), n, False)
 
-            # 2. site enabled
+            # 2. site enabled; the app's indicator setting is off
             await cdp.evaluate(s, """chrome.storage.local.set({vsrConfig:
-                {sites: {"127.0.0.1": true}, mode: 2, scale: 2}}).then(syncScripts)""")
-            ok &= check("whole segments       ", await run_page(cdp, page), n, True)
-            ok &= check("64 kB pieces         ", await run_page(cdp, page + "&piece=65536"), n, True)
+                {sites: {"127.0.0.1": true}, proxy: "http://127.0.0.1:%d"}}).then(syncScripts)""" % PROXY_PORT)
+            ok &= check("whole segments           ", await run_page(cdp, page + "&mark=1"), n, True)
+
+            # 3. the same with the indicator switched on in the app
+            proxy.terminate()
+            proxy.wait(timeout=10)
+            proxy = start_app(app, config, indicator=True)
+            ok &= check("64 kB pieces + indicator ", await run_page(cdp, page + "&piece=65536&mark=1"),
+                        n, True, expect_mark=True)
             await cdp.call("Browser.close")
 
         st = json.loads(wait_http(f"http://127.0.0.1:{PROXY_PORT}/status"))
-        print(f"proxy: {st['total_transforms']} segments, {st['total_frames']} frames, "
-              f"last {st['last_in']} -> {st['last_out']} {st['last_mode']}")
+        print(f"app: {st['total_transforms']} segments, {st['total_frames']} frames, "
+              f"last {st['last_in']} -> {st['last_out']} {st['last_mode']}, {st['fps'] or 0:.0f} fps")
     finally:
         for p in (chrome, proxy):
             if p:
@@ -307,6 +381,7 @@ async def main():
         # Chromium's zygotes run in nested sandboxes and can outlive the browser.
         subprocess.run(["pkill", "-f", f"user-data-dir={profile}"])
         shutil.rmtree(profile, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

@@ -26,19 +26,19 @@ hand the upscaled frame back to the player/compositor.
       RTX card, Turing (20xx) and newer; pre-Turing refused. Turing verified on
       an RTX 2060 SUPER ([`spike/results_turing.txt`](spike/results_turing.txt)).
       See [Hardware](#hardware).
-- [x] **Proxy core** — [`proxy/vsr_proxy.py`](proxy/vsr_proxy.py): local HTTP
-      transform service. `GET /upscale` (file source), `POST /transform` (raw
-      segment bytes — the browser-as-fetcher path, see DESIGN §9d), `/health`,
-      demo page. decode → VSR → H.264, GPU-serialized, DLPack-safe.
-- [x] **VRAM auto-downshift** — proxy picks the highest quality mode that fits
-      *live* free VRAM (ULTRA→HIGH→MEDIUM→LOW) so it coexists with a local LLM
-      instead of failing; `?strict=1` for exact-mode-or-503. DESIGN §9b.
-- [x] **Resolution policy** — output capped at 1440p (`--max-out`); sources
-      already ≥ cap pass through with zero GPU work/VRAM. DESIGN §9c.
+- [x] **The app** — [`app/`](app/): one Rust program that is both the local
+      proxy for browser video and the window that controls it. Decode, upscale
+      and encode all happen on the GPU (NVDEC → VSR → NVENC) with no Python
+      anywhere: 720p → 1440p at 7.5 ms/frame on an RTX 2060 SUPER. It takes
+      the target resolution from your displays, steps the quality down when
+      GPU memory or speed runs short, can start at login, makes Chromium
+      browsers load the extension by themselves, and can mark upscaled video
+      with an "RTX VSR" indicator. See
+      [Use it in the browser](#use-it-in-the-browser).
 - [x] **Browser extension** — [`extension/`](extension/) hooks MSE
       `SourceBuffer.appendBuffer` on enabled sites, sends each H.264 fragment to
-      `POST /transform?mse=1` and appends the upscaled fragment in its place
-      (per-site toggle). Verified in headless Chromium on a local DASH player
+      the app and appends the upscaled fragment in its place (per-site
+      switch). Verified in headless Chromium on a local DASH player
       ([`spike/test_extension.py`](spike/test_extension.py)) and against
       YouTube's player at the buffering level; see
       [Use it in the browser](#use-it-in-the-browser) for what is still rough.
@@ -108,41 +108,88 @@ HDR sources are not handled (the model is SDR); leave VSR off for those.
 
 ## Use it in the browser
 
-For Chromium-based browsers (Chrome, Vivaldi, Brave…). Start the proxy, then
-load the extension unpacked:
+For Chromium-based browsers (Chrome, Chromium, Vivaldi, Brave, Edge…). One
+program does it: the app is the local proxy that upscales the video and the
+window that controls it.
 
 ```bash
-uv venv --python 3.12 ~/vsr-venv && uv pip install --python ~/vsr-venv -r requirements.txt
-~/vsr-venv/bin/python proxy/vsr_proxy.py           # http://127.0.0.1:8730, add --max-out 2160 for 4K
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust, to build the app
+install/install_app.sh                                           # -> ~/.local/bin/rtx-vsr
+rtx-vsr
 ```
 
-`chrome://extensions` → Developer mode → *Load unpacked* → pick `extension/`.
-YouTube is enabled by default; the toolbar button opens a popup with a switch
-for the current site (the tab reloads), quality, factor and what the proxy and
-the tab are doing. The options page also has the site list and proxy address.
-After changing the files, press reload on the extension's card.
-A Flatpak browser cannot read the repo directory — copy `extension/` somewhere
-it can, e.g. `~/Downloads`.
+Then, in the window:
 
-What happens on an enabled site: VP9/AV1 are reported as unsupported so the
-player picks H.264; every `moof+mdat` fragment appended to a video
-SourceBuffer is upscaled by the proxy (output capped at the screen height) and
-appended with its original timestamps. Audio is untouched, and if the proxy is
-down or fails, the original bytes are appended instead.
+1. **Status → NVIDIA runtime.** If it says "Not installed", press *Download*.
+   The app fetches NVIDIA's VFX SDK from NVIDIA (pypi.nvidia.com, 422 MB,
+   checksum verified) and keeps the 175 MB of libraries VSR needs. A copy that
+   pip put in `~/vsr-venv` is used as it is. No Python is involved either way.
+2. **Browsers → Connect ‹your browser›.** From its next start the browser loads
+   the extension by itself — no developer mode, no "Load unpacked". Restart the
+   browser once.
+3. Play something. YouTube is enabled from the start; the extension's toolbar
+   button switches other sites on and off.
+
+| Setting | What it does |
+|---------|--------------|
+| Upscale video | The master switch. Off: video plays untouched. |
+| Upscale to | Resolution to upscale to. The list ends at your largest display's resolution. With several displays, video playing on a smaller one is upscaled only to *that* display's resolution. |
+| Quality | Low … Ultra (the model's four modes). Stepped down by itself when GPU memory is short or the card cannot keep up with playback. |
+| Show RTX VSR indicator | Draws an "RTX VSR" mark in the top right corner of a video while the frames on screen are upscaled ones. |
+| Start at login | Starts the app with your session. *Start minimized* (shown once this is on) keeps the window out of the way then. |
+
+The app upscales for as long as it runs; closing the window quits it, and
+video then simply plays as usual. Starting it a second time brings the window
+back.
+
+**What "Connect" does.** A running browser cannot be told to load anything,
+so the app writes a launcher override: a copy of the browser's own `.desktop`
+file in `~/.local/share/applications` with `--load-extension=…` added, and the
+extension itself where that browser can read it (for a Flatpak, inside
+`~/.var/app/<id>/`). Switching Connect off deletes both. If the browser is not
+listed, or you would rather do it by hand, *Extension folder* opens a copy to
+load with `chrome://extensions` → Developer mode → *Load unpacked*.
+
+**What happens on an enabled site.** VP9/AV1 are reported as unsupported so the
+player picks H.264; every `moof+mdat` fragment appended to a video SourceBuffer
+goes to the app, which decodes it (NVDEC), upscales it (VSR) and encodes it
+(NVENC) without the frames leaving the GPU, and comes back with the original
+timestamps. Audio is untouched, and if the app is not running or fails, the
+original bytes are appended instead.
+
+Measured on an RTX 2060 SUPER, whole pipeline, output 2560×1440:
+
+| Source | Medium | High | Ultra |
+|--------|--------|------|-------|
+| 720p | 7.5 ms/frame (134 fps) | 10.9 ms (92 fps) | 15.7 ms (64 fps) |
+| 1080p | 10.9 ms/frame (91 fps) | 19.5 ms (51 fps) | 30.4 ms (33 fps) |
+
+(Low is within a millisecond of Medium at these sizes.)
 
 Limits to know about:
 
 - H.264 only, so on YouTube the source is at most 1080p (which is the range
-  worth upscaling anyway). DRM video is never touched.
-- Decode and encode run on the CPU (x264). On a 2060 SUPER + 20-thread CPU
-  720p60 → 1080p runs at ~87 fps, about 1.4× real time; segments arrive a few
-  seconds later than usual, so seeking feels slower. NVENC would help.
-- Verified: the local player test, and YouTube buffering 40 s of 720p60 as
-  1080p with no errors. Not yet verified: long YouTube sessions in a normal
-  (non-headless) window — quality switches, ads, live streams.
+  worth upscaling anyway). DRM video is never touched. The model goes up to
+  4×, so 240p becomes 960p, not more.
+- Connect relies on Chromium's `--load-extension` switch, which takes effect
+  when the browser starts and which Google has been phasing out of branded
+  Chrome builds. If a browser stops honouring it, load the extension by hand.
+- Verified: the tests below, and YouTube in a headless browser (240p → 960p,
+  20 s buffered, indicator in place, no errors). Not yet verified: long
+  YouTube sessions in a normal window — quality switches, ads, live streams.
 
-mpv is the more polished route today; the extension is for staying in the
-browser.
+For scripts and machines without a display there are command-line forms of
+the same things: `rtx-vsr --headless`, `--install-runtime`, `--browsers`,
+`--connect <browser>` (see `rtx-vsr --help`).
+
+```bash
+(cd app && cargo test)                                  # MP4, sizing, launcher patching, …
+~/vsr-venv/bin/python spike/test_app_proxy.py           # the app's proxy against what MSE needs
+~/vsr-venv/bin/python spike/test_extension.py           # extension + app in a headless browser
+```
+
+mpv gives the better picture path (no re-encode); the app is for staying in
+the browser.
 
 ## Hardware
 
@@ -163,7 +210,7 @@ too old.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt      # nvidia-vfx, cupy, PyAV (all YT codecs), etc.
+pip install -r requirements.txt      # nvidia-vfx, cupy, PyAV, etc.
 source spike/env.sh                  # points CUDA_PATH/LD_LIBRARY_PATH at pip deps
 .venv/bin/python spike/bench_vsr.py            # GPU 0
 .venv/bin/python spike/bench_vsr.py 1          # GPU 1
@@ -172,29 +219,23 @@ source spike/env.sh                  # points CUDA_PATH/LD_LIBRARY_PATH at pip d
 Requires: NVIDIA driver ≥ 570.190 (Linux), RTX GPU with Tensor Cores.
 Tested target: 2× RTX 4090, driver 595.84, CUDA 13.2.
 
-**Every YouTube stream type is supported** — the proxy decodes via PyAV
-(FFmpeg), not just MP4: H.264/MP4, VP9/WebM, and AV1 all upscale (verified
-through the live `/transform` endpoint). Output is always H.264 (what browsers
-play back best); sources already ≥ 1440p pass through untouched.
-
 ## Licensing
 
 Our code: **MIT** (see [LICENSE](LICENSE)).
 The VFX SDK and its models are NVIDIA-proprietary (NGC license) and are
-**not redistributable** — this repo contains only glue code plus install
-scripts that fetch the SDK. Same pattern as `gst-nvmaxine` (LGPL plugin
+**not redistributable** — this repo contains only glue code; the app and the
+install scripts fetch the SDK from NVIDIA. Same pattern as `gst-nvmaxine` (LGPL plugin
 linking a proprietary library).
 
 ## Layout
 
 ```
 docs/DESIGN.md        full design doc (architecture, risks, references)
-proxy/vsr_proxy.py    local HTTP transform service (route B core)
-proxy/vsr_segment.py  MSE-correct fragment transform behind /transform?mse=1
-extension/            browser extension (MV3): MSE hook -> proxy
-spike/                M1/M1.5 benchmark harness + probes
+app/                  the app: GPU proxy + control window (Rust, iced)
+extension/            browser extension (MV3): MSE hook -> the app
+spike/                M1/M1.5 benchmark harness, probes, end-to-end tests
 gstreamer/            M2 GStreamer element
 mpv/                  M3 mpv filter: vsr.vpy (VapourSynth) + main.lua (toggle)
 chromium/             M4 compositor patch + interop prototype
-install/              check_gpu.py (hardware gate), install_mpv.sh
+install/              check_gpu.py (hardware gate), install_app.sh, install_mpv.sh
 ```

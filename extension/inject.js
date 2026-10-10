@@ -1,4 +1,4 @@
-/* RTX VSR Local Upscaler — page-world hook.
+/* RTX VSR — page-world hook.
  *
  * Registered by background.js only on enabled sites, in the MAIN world at
  * document_start, so it is in place before the player touches MSE.
@@ -6,9 +6,9 @@
  * What it does to a `video/mp4; codecs="avc1…"` SourceBuffer:
  *   - collects the appended bytes into complete top-level boxes,
  *   - keeps the stream's init segment (ftyp+moov),
- *   - sends init + each complete fragment (moof+mdat) to the local proxy via
+ *   - sends init + each complete fragment (moof+mdat) to the RTX VSR app via
  *     content.js -> background.js, and appends the upscaled H.264 fragment the
- *     proxy returns (preceded by the proxy's own init segment when it changes),
+ *     app returns (preceded by the app's own init segment when it changes),
  *   - on any failure appends the original bytes, so playback never breaks.
  *
  * The page keeps seeing a normal SourceBuffer: `updating` is true and
@@ -16,6 +16,9 @@
  *
  * Everything else (audio, WebM, other codecs) passes straight through. To get
  * H.264 from sites that prefer VP9/AV1, those are reported as unsupported.
+ *
+ * If the app's "indicator" setting is on, an "RTX VSR" mark is drawn in the
+ * top right corner of a video while the frames it shows are upscaled ones.
  */
 (() => {
   "use strict";
@@ -25,7 +28,7 @@
 
   const TIMEOUT_MS = 30000;
   const MAX_FAILURES = 3;
-  const stats = { transformed: 0, passthrough: 0, failures: 0, off: false, last: null };
+  const stats = { transformed: 0, passthrough: 0, failures: 0, off: false, last: null, indicator: false };
 
   // ---- steer the page to H.264 -------------------------------------------
   const OTHER_CODECS = /vp8|vp9|vp09|av01|hev1|hvc1/i;
@@ -47,18 +50,23 @@
         : origInfo(conf);
   }
 
-  // ---- transport to the proxy (via the isolated-world content script) ------
+  // ---- transport to the app (via the isolated-world content script) --------
   let nextId = 1;
   const waiting = new Map();
   window.addEventListener("message", (ev) => {
     const m = ev.data;
-    if (ev.source !== window || !m || m.__vsr !== "res") return;
+    if (ev.source !== window || !m) return;
+    if (m.__vsr === "cfgres") {
+      if (m.config) stats.indicator = !!(m.config.indicator && m.config.enabled);
+      return;
+    }
+    if (m.__vsr !== "res") return;
     const w = waiting.get(m.id);
     if (!w) return;
     waiting.delete(m.id);
     clearTimeout(w.timer);
     w.resolve(m.ok ? { init: new Uint8Array(m.init), media: new Uint8Array(m.media), meta: m.meta }
-                   : { failed: !m.passthrough });
+                   : { failed: !m.passthrough, meta: m.meta });
   });
 
   function transform(bytes) {
@@ -69,8 +77,10 @@
         resolve({ failed: true });
       }, TIMEOUT_MS);
       waiting.set(id, { resolve, timer });
-      const maxh = Math.round(screen.height * (window.devicePixelRatio || 1));
-      window.postMessage({ __vsr: "req", id, maxh, body: bytes.buffer }, "*", [bytes.buffer]);
+      // The screen this window is on, in CSS pixels: the app caps the output
+      // to that display's resolution.
+      const scr = { w: screen.width, h: screen.height, dpr: window.devicePixelRatio || 1 };
+      window.postMessage({ __vsr: "req", id, screen: scr, body: bytes.buffer }, "*", [bytes.buffer]);
     });
   }
 
@@ -111,19 +121,21 @@
 
   // ---- per-SourceBuffer state -----------------------------------------------
   const states = new WeakMap();
+  const streams = new WeakMap();   // MediaSource -> states of its SourceBuffers
   const wanted = (type) => /^video\/mp4/i.test(type || "") && /avc[13]/i.test(type);
 
   function setType(sb, type) {
     let st = states.get(sb);
     if (!st) {
-      st = { busy: false, gen: 0 };
+      st = { busy: false, gen: 0, sizes: new Set() };
       states.set(sb, st);
     }
     st.intercept = wanted(type);
     resetParser(st);
     st.init = null;        // the page's init segment (ftyp+moov)
     st.initParts = [];
-    st.ours = null;        // proxy init segment currently in effect, if any
+    st.ours = null;        // app's init segment currently in effect, if any
+    return st;
   }
   function resetParser(st) {
     st.acc = new Uint8Array(0);   // bytes not yet forming a complete box
@@ -134,7 +146,11 @@
   const origAdd = MS.prototype.addSourceBuffer;
   MS.prototype.addSourceBuffer = function (type) {
     const sb = origAdd.call(this, type);
-    try { setType(sb, type); } catch (_) {}
+    try {
+      const st = setType(sb, type);
+      if (!streams.has(this)) streams.set(this, []);
+      streams.get(this).push(st);
+    } catch (_) {}
     return sb;
   };
   const origChange = SB.prototype.changeType;
@@ -186,16 +202,25 @@
           stats.transformed++;
           stats.failures = 0;
           stats.last = res.meta;
+          if (res.meta) {
+            // Frames of this size are upscaled ones (see the indicator).
+            if (res.meta.out) st.sizes.add(res.meta.out);
+            if ("indicator" in res.meta) stats.indicator = !!res.meta.indicator;
+          }
+          watchVideos();
         } else {
           if (res.failed && ++stats.failures >= MAX_FAILURES) {
             stats.off = true;
-            console.warn("[vsr] proxy keeps failing — passing video through until reload");
+            console.warn("[vsr] the RTX VSR app keeps failing — passing video through until reload");
           }
           if (st.ours) {         // back to the page's own stream description
             out.push(st.init);
             st.ours = null;
           }
           out.push(original);
+          // Originals of this size are in the buffer now: it no longer
+          // tells upscaled frames apart (see the indicator).
+          if (res.meta && res.meta.in) st.sizes.delete(res.meta.in);
           stats.passthrough++;
         }
       } else if (st.moof || !st.init) {
@@ -221,6 +246,32 @@
   });
 
   const origAppend = SB.prototype.appendBuffer;
+
+  /* The real append of what `process` produced. Upscaled video is several
+   * times the bytes the player budgeted for, so the buffer can be full where
+   * the original would have fitted: then the page keeps seeing `updating`
+   * and the append is retried as playback frees space, which is the pace the
+   * player would have settled on by itself. */
+  function finishAppend(sb, st, gen, out) {
+    if (st.gen !== gen) return;          // aborted meanwhile
+    // The real append fires its own updatestart; the page already had ours.
+    const swallow = (ev) => ev.stopImmediatePropagation();
+    sb.addEventListener("updatestart", swallow, { capture: true, once: true });
+    try {
+      origAppend.call(sb, out);
+      st.busy = false;
+    } catch (e) {
+      sb.removeEventListener("updatestart", swallow, { capture: true });
+      if (e && e.name === "QuotaExceededError") {
+        setTimeout(() => finishAppend(sb, st, gen, out), 1000);
+        return;
+      }
+      st.busy = false;
+      console.warn("[vsr] append failed:", e);
+      fire(sb, ["error", "updateend"]);
+    }
+  }
+
   SB.prototype.appendBuffer = function (data) {
     const sb = this, st = states.get(sb);
     if (!st || !st.intercept) return origAppend.call(sb, data);
@@ -235,18 +286,11 @@
       return bytes;
     }).then((out) => {
       if (st.gen !== gen) return;        // aborted meanwhile
-      st.busy = false;
-      if (!out.length) return fire(sb, ["update", "updateend"]);
-      // The real append fires its own updatestart; the page already had ours.
-      const swallow = (ev) => ev.stopImmediatePropagation();
-      sb.addEventListener("updatestart", swallow, { capture: true, once: true });
-      try {
-        origAppend.call(sb, out);
-      } catch (e) {
-        sb.removeEventListener("updatestart", swallow, { capture: true });
-        console.warn("[vsr] append failed:", e);
-        fire(sb, ["error", "updateend"]);
+      if (!out.length) {
+        st.busy = false;
+        return fire(sb, ["update", "updateend"]);
       }
+      finishAppend(sb, st, gen, out);
     });
   };
 
@@ -279,6 +323,96 @@
         d.set.call(this, v);
       },
     });
+  }
+
+  // ---- the "RTX VSR" indicator ---------------------------------------------------
+  // A <video> plays a MediaSource through an object URL; remember which.
+  const sources = new Map();       // object URL -> WeakRef(MediaSource)
+  const origCreateURL = URL.createObjectURL;
+  URL.createObjectURL = function (obj) {
+    const url = origCreateURL.apply(this, arguments);
+    try {
+      if (obj instanceof MS) {
+        for (const [u, ref] of sources) if (!ref.deref()) sources.delete(u);
+        sources.set(url, new WeakRef(obj));
+      }
+    } catch (_) {}
+    return url;
+  };
+
+  /* Is this element showing upscaled frames right now? The decoded size is
+   * the proof: the app's output is larger than anything the page appended. */
+  function upscaled(video) {
+    if (!video.videoWidth || video.readyState < 2) return false;
+    const ref = sources.get(video.currentSrc || video.src);
+    const list = ref && ref.deref() && streams.get(ref.deref());
+    const size = video.videoWidth + "x" + video.videoHeight;
+    return !!list && list.some((st) => st.sizes.has(size));
+  }
+
+  const marks = new WeakMap();     // <video> -> its indicator element
+  function makeMark() {
+    // Built with DOM calls and style properties only: pages may forbid
+    // innerHTML (Trusted Types) and inline style attributes (CSP).
+    const el = document.createElement("div");
+    el.setAttribute("data-rtx-vsr-indicator", "");
+    el.setAttribute("aria-hidden", "true");
+    Object.assign(el.style, {
+      position: "absolute", zIndex: "2147483000", display: "none", pointerEvents: "none",
+      boxSizing: "border-box", flexDirection: "column", alignItems: "center", justifyContent: "center",
+      background: "#76b900", color: "#fff", borderRadius: "14%", opacity: "0.92",
+      boxShadow: "0 1px 5px rgba(0,0,0,.55)", userSelect: "none", margin: "0", padding: "0",
+      fontFamily: "system-ui, 'Segoe UI', Roboto, Arial, sans-serif", fontWeight: "800",
+      letterSpacing: "0.02em", textAlign: "center", textShadow: "none", lineHeight: "1.08",
+    });
+    for (const word of ["RTX", "VSR"]) {
+      const line = document.createElement("div");
+      line.textContent = word;
+      el.appendChild(line);
+    }
+    return el;
+  }
+
+  function placeMark(video) {
+    let el = marks.get(video);
+    const host = video.offsetParent;   // null while the element is not laid out
+    const show = stats.indicator && !!host && video.clientWidth > 0 && upscaled(video);
+    if (!show) {
+      if (el) el.style.display = "none";
+      return;
+    }
+    if (!el) marks.set(video, el = makeMark());
+    if (el.parentNode !== host) host.appendChild(el);
+    // The picture's box inside the element (letterboxed unless told otherwise).
+    const ew = video.clientWidth, eh = video.clientHeight;
+    let w = ew, h = eh;
+    const fit = getComputedStyle(video).objectFit;
+    if (fit !== "fill" && fit !== "cover") {
+      const s = Math.min(ew / video.videoWidth, eh / video.videoHeight);
+      w = video.videoWidth * s;
+      h = video.videoHeight * s;
+    }
+    const side = Math.round(Math.max(26, Math.min(64, h * 0.075)));
+    const gap = Math.round(side * 0.3);
+    const left = video.offsetLeft + video.clientLeft + (ew - w) / 2 + w - side - gap;
+    const top = video.offsetTop + video.clientTop + (eh - h) / 2 + gap;
+    Object.assign(el.style, {
+      display: "flex", left: Math.round(left) + "px", top: Math.round(top) + "px",
+      width: side + "px", height: side + "px", fontSize: Math.round(side * 0.34) + "px",
+    });
+  }
+
+  let watching = false, ticks = 0;
+  function watchVideos() {         // started by the first upscaled fragment
+    if (watching) return;
+    watching = true;
+    setInterval(() => {
+      // The app's setting may change while nothing is being appended.
+      if (ticks++ % 4 === 0) window.postMessage({ __vsr: "cfg" }, "*");
+      for (const video of document.querySelectorAll("video")) {
+        try { placeMark(video); } catch (_) {}
+      }
+    }, 500);
   }
 
   window.__vsr = { status: () => Object.assign({}, stats) };

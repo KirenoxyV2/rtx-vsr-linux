@@ -1,22 +1,27 @@
-/* RTX VSR Local Upscaler — toolbar popup.
+/* RTX VSR — toolbar popup.
  *
- * The config lives in the service worker (one copy of the defaults and of the
- * host matching), so this only asks it for the state and sends changes back.
- * Quality and factor apply to the next segment; the site switch needs the
- * page-world hook added or removed at document_start, so it reloads the tab.
+ * The site list lives in the service worker (one copy of the defaults and of
+ * the host matching), so this only asks it for the state and sends changes
+ * back. The site switch needs the page-world hook added or removed at
+ * document_start, so it reloads the tab. Everything about how video is
+ * upscaled is a setting of the app; the popup only reports it.
  */
 const $ = (id) => document.getElementById(id);
 const send = (msg) => chrome.runtime.sendMessage(msg);
+const MODES = ["", "Low", "Medium", "High", "Ultra"];
 
-async function checkProxy(url) {
+async function showApp(url) {
+  const el = $("appState");
   try {
-    const h = await (await fetch(url + "/health")).json();
-    $("proxyState").textContent = h.ok
-      ? `Proxy running on ${h.gpu} (${(h.free_mb / 1024).toFixed(1)} GB free).`
-      : `Proxy is up but the GPU is not ready: ${h.err}`;
+    const [h, c] = await Promise.all(["/health", "/config"].map(
+      async (path) => (await fetch(url + path, { cache: "no-store" })).json()));
+    el.className = "box " + (h.ok ? "ok" : "bad");
+    if (!h.ok) el.textContent = `The RTX VSR app is running, but: ${h.err}`;
+    else if (!c.enabled) el.textContent = "Upscaling is switched off in the RTX VSR app.";
+    else el.textContent = `Upscaling to ${c.target[0]}×${c.target[1]}, ${MODES[c.quality]} quality, on ${h.gpu}.`;
   } catch (_) {
-    $("proxyState").textContent =
-      `No proxy at ${url}. Start it with: python proxy/vsr_proxy.py`;
+    el.className = "box bad";
+    el.textContent = "The RTX VSR app is not running. Start it to upscale video; until then video plays as usual.";
   }
 }
 
@@ -35,7 +40,7 @@ async function showPageState(tabId) {
   if (!st) {
     el.textContent = "Not active in this tab yet — reload the page.";
   } else if (st.off) {
-    el.textContent = "Switched itself off in this tab after repeated proxy failures — reload to retry.";
+    el.textContent = "Switched itself off in this tab after repeated failures — reload to retry.";
   } else if (!st.transformed) {
     el.textContent = st.passthrough
       ? `Nothing upscaled yet (${st.passthrough} segments passed through).`
@@ -49,9 +54,7 @@ async function showPageState(tabId) {
 async function load() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const st = await send({ type: "state", url: tab && tab.url });
-  $("mode").value = st.cfg.mode;
-  $("scale").value = st.cfg.scale;
-  checkProxy(st.cfg.proxy);
+  showApp(st.cfg.proxy);
 
   if (!st.host) {
     $("site").textContent = "This page";
@@ -72,11 +75,6 @@ async function load() {
   });
 }
 
-$("mode").addEventListener("change", () => send({ type: "set", mode: Number($("mode").value) }));
-$("scale").addEventListener("change", () => {
-  const scale = Number($("scale").value);
-  if (scale >= 1.1 && scale <= 4) send({ type: "set", scale });
-});
 $("options").addEventListener("click", (ev) => {
   ev.preventDefault();
   chrome.runtime.openOptionsPage();

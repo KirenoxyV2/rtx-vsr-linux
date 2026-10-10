@@ -231,10 +231,13 @@ rtx-vsr-linux/
 ├── lib/vsr-glue/             ← C++ wrapper: CUDA buffer in/out, frame pool, mode API
 ├── gstreamer/gst-nvvfx/      ← M2: refreshed GStreamer element (fork of gst-nvmaxine)
 ├── mpv/                      ← M3: vsr.vpy (VapourSynth filter) + main.lua (toggle)
+├── app/                      ← browser path: GPU proxy + control window (Rust, §9g)
+├── extension/                ← browser path: MSE hook that feeds the app (§9f)
 ├── chromium/patches/         ← M4: feature flag + post-decode hook + interop
 ├── benchmarks/               ← ms/frame tables per mode/resolution; A/B screenshots
 ├── install/                  ← SDK fetch scripts (NGC), driver checks, CI matrix
 │   ├── check_gpu.py          ← hardware gate: supported/unsupported
+│   ├── install_app.sh        ← builds the app, installs ~/.local/bin/rtx-vsr
 │   └── install_mpv.sh        ← venv for mpv's embedded Python + script link
 ```
 
@@ -448,7 +451,7 @@ Chromium playing a DASH stream through the extension).
   proxy's init segment is in effect, the page's own init segment is
   re-appended first.
 
-**State.** The local test passes (whole segments, 64 kB pieces, with audio):
+**State** (as of the Python proxy; §9g replaces the proxy side). The local test passes (whole segments, 64 kB pieces, with audio):
 640×360 in, upscaled video out, buffered range identical to the unmodified
 run, no dropped frames. On YouTube (headless, Big Buck Bunny): avc1 720p60
 served, decoded as 1920×1080, 8 segments / 2474 frames transformed, 41 s
@@ -458,6 +461,114 @@ live streams are unverified. Cost is CPU-bound: 720p60 → 1080p at 11.4
 ms/frame end to end with x264, 1.4× real time on the 2060 SUPER machine.
 NVENC is not in the PyAV or imageio-ffmpeg builds; it needs a system FFmpeg
 or a custom PyAV.
+
+### 9g. The app: the proxy as one all-GPU program (2026-10-11)
+
+§9d–§9f left the browser path as a Python script plus an extension to load by
+hand, with decode and encode on the CPU. `app/` replaces the script (which is
+gone, with its tests) by one Rust program that is the proxy and a window to
+control it. The protocol towards the extension is §9f's, minus the knobs:
+quality and target size are the app's settings now, and the extension only
+reports which screen the page is on.
+
+**The pipeline** (`app/src/engine/`, `app/src/gpu/`), one fragment at a time on
+a single thread that owns the CUDA context:
+
+```
+init + moof/mdat ─ demux (mp4.rs) ─ Annex B ─ NVDEC (cuvid parser + decoder)
+   NV12 in CUDA memory ─ NvCVImage_TransferFromYUV ─ BGRA ─ VideoSuperRes
+   BGRA ─ NvCVImage_TransferToYUV ─ NV12 ─ NVENC ─ length-prefixed NALs ─ mux
+```
+
+Nothing is copied to system memory except the compressed bytes. On the
+2060 SUPER, 720p → 1440p MEDIUM takes 7.5 ms/frame in total (the model alone
+is 4.3), where the Python proxy needed 11.4 ms/frame for 720p → 1080p.
+
+What it took, in the order the questions came up:
+
+- **No Python is needed to run the model.** The `nvidia-vfx` wheel is the VFX
+  SDK's C libraries plus a thin binding; `NvVFX_*` and `NvCVImage_*` are
+  exported and match the SDK's public headers (pixel-format enum included:
+  `NVCV_YUV420` is 10). The libraries' RPATHs do not cover each other, so they
+  are opened by full path, dependencies first, with `RTLD_GLOBAL` — what
+  NVIDIA's `_lib_loader.py` does. VSR needs only a dozen of them (175 MB of
+  the wheel's 580); the app downloads the wheel from pypi.nvidia.com itself
+  (pinned version, SHA-256 checked) or uses a copy that pip installed.
+- **`VideoSuperRes` takes 8-bit BGRA or RGBA, chunky, in CUDA memory**, and
+  nothing else: planar float (what the Python binding exposes) is refused
+  with `NVCV_ERR_PIXELFORMAT`. That is the convenient case — it is what NV12
+  converts to in one `NvCVImage_Transfer`.
+- **`NvVFX_SetImage` keeps the pointer to the `NvCVImage` descriptor**, not a
+  copy. A descriptor that moves afterwards (a struct returned by value) makes
+  `NvVFX_Run` fail with a pixel-format error that points nowhere near the
+  cause. The descriptors are boxed.
+- **A cuvid parser cannot be reset**, so each fragment gets a new one (it is
+  only a bitstream parser); the decoder is kept while the format stays the
+  same. Timestamps go in with each access unit and come back with each
+  picture in presentation order; a fragment whose pictures do not all come
+  back is refused rather than appended with holes.
+- **NVENC**: SDK 13.0 structures (driver 570+, the VFX floor), bindings
+  generated from FFmpeg's `nv-codec-headers` and loaded with `dlopen`, so a
+  missing driver is a message in the window, not a failure to start. No
+  B-frames, IDR at the start of every fragment and every second after,
+  constant quality with a ceiling of 0.09 bit per pixel per frame (10 Mbit/s
+  at 1440p30).
+- **Colour.** A stream that does not say which matrix it uses is shown by
+  Chromium as BT.601 below 720 lines and BT.709 from there up. Upscaling moves
+  a 360p stream across that line, so the output always carries an explicit
+  description: the source's, or what Chromium would have assumed for the
+  source's size. Both conversions use the same matrix and range.
+  (`spike/test_app_proxy.py` measures the difference from the source: 1.1 of
+  an 8-bit step, against 3.5 with the wrong matrix.)
+- **The target size comes from the displays.** The picker ends at the largest
+  display; each request carries the page's `screen` size, the app finds the
+  display that matches and never upscales past it (fit inside
+  `min(chosen, that display)`, at most the model's 4×).
+- **Two automatic step-downs**: the VRAM estimate of §9b, checked when a model
+  is loaded, and speed — two fragments in a row processed slower than they
+  play lower the mode by one until the stream goes idle.
+- **Upscaled video is several times the bytes** the player budgeted for, and
+  Chromium's SourceBuffer holds 150 MB. When the real append hits
+  `QuotaExceededError` the hook keeps `updating` true and retries each second,
+  which paces the player the way a slow network would.
+- **GPU memory is released after 45 s without work** (decoder, model,
+  encoder); the CUDA context stays. Nothing is created until the first
+  fragment arrives, so the app idles at zero VRAM.
+- **Only extensions may use the endpoint.** A request with a web page's
+  `Origin`, or a foreign `Host`, gets 403: a site must not be able to drive
+  the GPU of whoever visits it.
+
+**Getting the extension into the browser without the user doing it.** A
+running browser offers nothing: remote debugging is off (and refused for the
+default profile since Chrome 136), policy and external-extension directories
+need root or the Web Store, and intercepting HTTPS would mean a root
+certificate. What is left is the start: the app writes a copy of the
+browser's `.desktop` file into `~/.local/share/applications` with
+`--load-extension=<dir> --disable-features=DisableLoadExtensionCommandLineSwitch`
+on every `Exec` line, and the extension into a directory that browser can
+read (inside `~/.var/app/<id>` for a Flatpak). The manifest carries a public
+key, so the extension has the same ID wherever it is loaded from. The
+override is marked, refreshed at each start of the app and removed by the
+same switch; a launcher the user wrote is left alone.
+`spike/test_extension.py` starts the browser with exactly the override's
+command line.
+
+**The indicator.** Whether a video is showing upscaled frames is read from
+the decoder, not assumed: the hook remembers the output sizes the app
+returned for a stream, and a `<video>` playing that MediaSource whose
+`videoWidth × videoHeight` is one of them is showing them. The mark is a DOM
+element (no `innerHTML`, no style attribute: Trusted Types and CSP) placed in
+the picture's top right corner inside the video's offset parent, which keeps
+it under the player's own controls and inside whatever goes fullscreen.
+
+**The window** is an iced daemon with one window, software-rendered
+(tiny-skia): a settings panel does not need a second GPU context. "Start
+minimized" minimises the window at login; a second launch opens a new window
+instead of trying to raise the old one, which Wayland does not allow.
+
+Open: long sessions on YouTube in a normal window (quality switches, ads,
+live), a tray icon for desktops that have one, VP9 through NVDEC (Turing
+decodes it) so that steering to H.264 becomes optional.
 
 ## 10. References
 

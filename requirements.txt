@@ -1,10 +1,12 @@
-# Runtime deps (pip-only; no system CUDA toolkit, no NGC key).
-# Install:  pip install -r requirements.txt
-# Then:     source spike/env.sh   (points CUDA_PATH/LD_LIBRARY_PATH at the pip wheels)
+# Python packages for the scripts in spike/ (probes, benchmarks and the tests of
+# the app and the extension). The app itself (app/) needs none of them, and
+# install/install_mpv.sh builds its own environment for mpv.
+# Install:  uv venv --python 3.12 ~/vsr-venv && uv pip install --python ~/vsr-venv -r requirements.txt
 
 nvidia-vfx>=0.1.0            # NVIDIA VFX SDK w/ RTX Video Super Resolution (pip wheel bundles TensorRT + cuDNN)
 cupy-cuda12x[ctk]>=13        # GPU-resident frame tensors (H2D/D2H, DLPack interop with nvvfx)
 nvidia-curand-cu12           # random warmup frames for the VSR engine
-opencv-python-headless       # cv2 fallback decoder + image utils (PyAV is primary)
-av>=12                       # PyAV: decodes EVERY YouTube codec — H.264, HEVC, VP8/VP9, AV1 (incl. WebM/CMAF)
-imageio-ffmpeg               # bundled static ffmpeg for the H.264 encode step
+opencv-python-headless       # image utils for the probes
+av>=12                       # PyAV: reads back what the app produced, in the tests
+imageio-ffmpeg               # bundled static ffmpeg: builds the tests' DASH streams
+websockets                   # spike/test_extension.py drives the browser over DevTools

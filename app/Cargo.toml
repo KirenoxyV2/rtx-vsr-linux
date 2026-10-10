@@ -1,0 +1,28 @@
+[package]
+name = "rtx-vsr"
+version = "0.3.0"
+edition = "2021"
+description = "RTX Video Super Resolution for Linux: a local upscaling proxy for browser video, with a small control panel"
+license = "MIT"
+repository = "https://github.com/akdnexpat/rtx-vsr-linux"
+
+[dependencies]
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "x11", "wayland"] }
+winit = "0.30"
+libloading = "0.8"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+ureq = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+flate2 = "1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+
+[profile.dev]
+opt-level = 1

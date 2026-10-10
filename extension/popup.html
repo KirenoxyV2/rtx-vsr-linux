@@ -5,15 +5,17 @@
 <title>RTX VSR</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font: 13px/1.5 system-ui, sans-serif; margin: 0; padding: 14px 16px; width: 280px; }
-  h1 { font-size: 14px; margin: 0 0 10px; }
+  body { font: 13px/1.5 system-ui, sans-serif; margin: 0; padding: 14px 16px; width: 290px; }
+  h1 { font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  h1 img { width: 20px; height: 20px; }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
   .row > span { font-weight: 600; }
   #site { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  select, input[type=number] { width: 150px; box-sizing: border-box; padding: 4px; font: inherit; }
   input[type=checkbox] { width: 18px; height: 18px; flex: none; accent-color: #76b900; }
   small { display: block; color: #666; }
   .box { margin-top: 12px; padding: 8px 10px; border-radius: 6px; background: #f2f2f2; }
+  .box.ok { border-left: 3px solid #76b900; }
+  .box.bad { border-left: 3px solid #d9822b; }
   a { display: inline-block; margin-top: 12px; color: inherit; }
   @media (prefers-color-scheme: dark) {
     small { color: #aaa; }
@@ -22,7 +24,7 @@
 </style>
 </head>
 <body>
-  <h1>RTX VSR Local Upscaler</h1>
+  <h1><img src="icons/icon-48.png" alt="">RTX VSR</h1>
 
   <label class="row">
     <span id="site">…</span>
@@ -30,23 +32,11 @@
   </label>
   <small id="siteNote"></small>
 
-  <label class="row"><span>Quality</span>
-    <select id="mode">
-      <option value="1">LOW — fastest</option>
-      <option value="2">MEDIUM</option>
-      <option value="3">HIGH</option>
-      <option value="4">ULTRA — slowest</option>
-    </select>
-  </label>
-
-  <label class="row"><span>Upscale factor</span>
-    <input id="scale" type="number" min="1.1" max="4" step="0.1">
-  </label>
-
   <div class="box" id="pageState" hidden></div>
-  <div class="box" id="proxyState">Checking proxy…</div>
+  <div class="box" id="appState">Looking for the RTX VSR app…</div>
+  <small>Resolution, quality and the on-video indicator are set in the app.</small>
 
-  <a href="#" id="options">All options…</a>
+  <a href="#" id="options">Sites and options…</a>
 
   <script src="popup.js"></script>
 </body>

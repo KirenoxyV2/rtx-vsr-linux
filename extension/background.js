@@ -1,17 +1,18 @@
-/* RTX VSR Local Upscaler — service worker.
+/* RTX VSR — service worker.
  *
  *  - keeps the content scripts registered for exactly the enabled sites
  *    (so the page-world hook is present from document_start, with no config
  *    race, and absent everywhere else),
- *  - holds the config for the toolbar popup, which toggles the current
- *    tab's site and sets quality and factor,
- *  - relays segments to the local proxy: requests from here are not subject
+ *  - holds the site list for the toolbar popup, which toggles the current
+ *    tab's site,
+ *  - relays segments to the RTX VSR app: requests from here are not subject
  *    to the page's CSP/CORS or local-network permission prompts.
+ *
+ * Quality, target resolution and the on-video indicator are settings of the
+ * app, not of the extension; pages ask for them through "appConfig".
  */
 const DEFAULTS = {
   proxy: "http://127.0.0.1:8730",
-  mode: 2,                          // 1 LOW  2 MEDIUM  3 HIGH  4 ULTRA
-  scale: 2,
   sites: { "youtube.com": true },
 };
 
@@ -82,8 +83,17 @@ function updateConfig(change) {
   return writing;
 }
 
-// Messages from the toolbar popup (popup.js).
-const popup = {
+// The app's own settings (GET /config), or null when it is not running.
+async function appConfig() {
+  const cfg = await getConfig();
+  try {
+    const r = await fetch(cfg.proxy + "/config", { cache: "no-store" });
+    return r.ok ? await r.json() : null;
+  } catch (_) { return null; }
+}
+
+const requests = {
+  // from the toolbar popup (popup.js)
   async state(msg) {
     const cfg = await getConfig(), host = siteOf(msg.url || "");
     return { cfg, host, site: host && siteKey(cfg, host), enabled: enabledFor(cfg, host) };
@@ -97,38 +107,40 @@ const popup = {
     await syncScripts();
     chrome.tabs.reload(msg.tabId);  // hooks attach at document_start
   },
-  set(msg) {
-    return updateConfig((cfg) => {
-      for (const k of ["mode", "scale"]) if (typeof msg[k] === "number") cfg[k] = msg[k];
-    });
-  },
+  // from pages (content.js)
+  appConfig,
 };
 
 async function transform(msg) {
   const cfg = await getConfig();
   const body = Uint8Array.fromBase64 ? Uint8Array.fromBase64(msg.body)
     : Uint8Array.from(atob(msg.body), (c) => c.charCodeAt(0));
-  const url = `${cfg.proxy}/transform?mse=1&mode=${cfg.mode}&scale=${cfg.scale}` +
-              (msg.maxh ? `&maxh=${msg.maxh}` : "");
-  const r = await fetch(url, { method: "POST", body });
-  if (r.status === 204) return { ok: false, passthrough: true };
-  if (!r.ok) throw new Error("proxy HTTP " + r.status);
+  // The screen the page is on: the app never upscales past what it can show.
+  const s = msg.screen || {};
+  const query = s.w && s.h ? `?sw=${s.w}&sh=${s.h}&dpr=${s.dpr || 1}` : "";
+  const r = await fetch(`${cfg.proxy}/transform${query}`, { method: "POST", body });
+  let meta = null;
+  try { meta = JSON.parse(r.headers.get("X-VSR-Meta")); } catch (_) {}
+  if (r.status === 204) return { ok: false, passthrough: true, meta };
+  if (!r.ok) throw new Error("app answered HTTP " + r.status);
   const out = new Uint8Array(await r.arrayBuffer());
+  // Whatever answers on that port must be the app: its reply says where the
+  // init segment ends. Anything else is not something to append.
+  const initLen = Number(r.headers.get("X-VSR-Init-Length"));
+  if (!(initLen > 0 && initLen < out.length)) throw new Error("the answer is not from the RTX VSR app");
   let b64;
   if (out.toBase64) b64 = out.toBase64();
   else {
-    let s = "";
-    for (let i = 0; i < out.length; i += 0x8000) s += String.fromCharCode.apply(null, out.subarray(i, i + 0x8000));
-    b64 = btoa(s);
+    let str = "";
+    for (let i = 0; i < out.length; i += 0x8000) str += String.fromCharCode.apply(null, out.subarray(i, i + 0x8000));
+    b64 = btoa(str);
   }
-  let meta = null;
-  try { meta = JSON.parse(r.headers.get("X-VSR-Meta")); } catch (_) {}
-  return { ok: true, body: b64, initLen: Number(r.headers.get("X-VSR-Init-Length")), meta };
+  return { ok: true, body: b64, initLen, meta };
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg && Object.hasOwn(popup, msg.type)) {
-    popup[msg.type](msg).then(sendResponse, (e) => {
+  if (msg && Object.hasOwn(requests, msg.type)) {
+    requests[msg.type](msg).then(sendResponse, (e) => {
       console.warn("[vsr] " + msg.type + " failed:", e.message);
       sendResponse(null);
     });
