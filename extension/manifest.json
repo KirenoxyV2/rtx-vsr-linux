@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "RTX VSR Local Upscaler",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Upscales low-res H.264 web video (e.g. YouTube) through a local NVIDIA RTX VSR proxy. Non-DRM only; per-site toggle.",
   "minimum_chrome_version": "111",
   "permissions": ["storage", "scripting", "tabs"],
@@ -11,6 +11,7 @@
   },
   "options_page": "options.html",
   "action": {
-    "default_title": "RTX VSR — click to toggle this site"
+    "default_title": "RTX VSR",
+    "default_popup": "popup.html"
   }
 }

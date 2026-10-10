@@ -117,8 +117,10 @@ uv venv --python 3.12 ~/vsr-venv && uv pip install --python ~/vsr-venv -r requir
 ```
 
 `chrome://extensions` → Developer mode → *Load unpacked* → pick `extension/`.
-YouTube is enabled by default; the toolbar button toggles the current site
-(the tab reloads), and the options page sets quality, factor and site list.
+YouTube is enabled by default; the toolbar button opens a popup with a switch
+for the current site (the tab reloads), quality, factor and what the proxy and
+the tab are doing. The options page also has the site list and proxy address.
+After changing the files, press reload on the extension's card.
 A Flatpak browser cannot read the repo directory — copy `extension/` somewhere
 it can, e.g. `~/Downloads`.
 

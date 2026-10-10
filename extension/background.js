@@ -3,7 +3,8 @@
  *  - keeps the content scripts registered for exactly the enabled sites
  *    (so the page-world hook is present from document_start, with no config
  *    race, and absent everywhere else),
- *  - toolbar button toggles the current tab's site,
+ *  - holds the config for the toolbar popup, which toggles the current
+ *    tab's site and sets quality and factor,
  *  - relays segments to the local proxy: requests from here are not subject
  *    to the page's CSP/CORS or local-network permission prompts.
  */
@@ -64,17 +65,44 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
   if (info.status === "loading") paint(tabId, tab.url);
 });
 
-chrome.action.onClicked.addListener(async (tab) => {
-  const host = siteOf(tab.url || "");
-  if (!host) return;
-  const cfg = await getConfig();
-  // Toggle the entry that covers this host, or add the host itself.
-  const key = Object.keys(cfg.sites).find((s) => host === s || host.endsWith("." + s)) || host;
-  cfg.sites = Object.assign({}, cfg.sites, { [key]: !cfg.sites[key] });
-  await chrome.storage.local.set({ vsrConfig: cfg });
-  await syncScripts();
-  chrome.tabs.reload(tab.id);       // hooks attach at document_start
-});
+// The entry that covers this host, or the host itself if none does yet.
+const siteKey = (cfg, host) =>
+  Object.keys(cfg.sites).find((s) => host === s || host.endsWith("." + s)) || host;
+
+// Serialized like syncScripts: two changes in quick succession would each
+// read the old config and the second write would drop the first.
+let writing = Promise.resolve();
+function updateConfig(change) {
+  const run = async () => {
+    const cfg = await getConfig();
+    change(cfg);
+    await chrome.storage.local.set({ vsrConfig: cfg });
+  };
+  writing = writing.then(run, run);
+  return writing;
+}
+
+// Messages from the toolbar popup (popup.js).
+const popup = {
+  async state(msg) {
+    const cfg = await getConfig(), host = siteOf(msg.url || "");
+    return { cfg, host, site: host && siteKey(cfg, host), enabled: enabledFor(cfg, host) };
+  },
+  async setSite(msg) {
+    const host = siteOf(msg.url || "");
+    if (!host) return;
+    await updateConfig((cfg) => {
+      cfg.sites = Object.assign({}, cfg.sites, { [siteKey(cfg, host)]: !!msg.on });
+    });
+    await syncScripts();
+    chrome.tabs.reload(msg.tabId);  // hooks attach at document_start
+  },
+  set(msg) {
+    return updateConfig((cfg) => {
+      for (const k of ["mode", "scale"]) if (typeof msg[k] === "number") cfg[k] = msg[k];
+    });
+  },
+};
 
 async function transform(msg) {
   const cfg = await getConfig();
@@ -99,6 +127,13 @@ async function transform(msg) {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && Object.hasOwn(popup, msg.type)) {
+    popup[msg.type](msg).then(sendResponse, (e) => {
+      console.warn("[vsr] " + msg.type + " failed:", e.message);
+      sendResponse(null);
+    });
+    return true;
+  }
   if (!msg || msg.type !== "transform") return;
   transform(msg).then(sendResponse, (e) => {
     console.warn("[vsr] transform failed:", e.message);

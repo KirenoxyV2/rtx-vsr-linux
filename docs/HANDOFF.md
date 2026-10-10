@@ -34,9 +34,11 @@ and §9f (browser).
     whose embedded Python is 3.13. Must not contain `vapoursynth`.
 - mpv: Flatpak `io.mpv.Mpv` 0.41.0 (VapourSynth R73 built in, bundles yt-dlp).
   `~/.var/app/io.mpv.Mpv/config/mpv/scripts/rtx-vsr` → symlink to `mpv/`.
-- Browser: Flatpak `com.vivaldi.Vivaldi` (Chromium 152). The extension is
-  **not** loaded into the user's real profile — only into throwaway test
-  profiles.
+- Browser: Flatpak `com.vivaldi.Vivaldi` (Chromium 152). The user's real
+  profile loads the extension unpacked from `~/Documents/extension` — a
+  **copy** of `extension/` (the Flatpak cannot read the repo). After changing
+  the extension: `cp extension/* ~/Documents/extension/`, then press reload on
+  its card in `vivaldi://extensions`.
 - An ffmpeg binary for making test clips:
   `~/vsr-venv/bin/python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"`.
 
@@ -86,12 +88,12 @@ browser with DevTools on 9333; it cleans all three up.
 
 ## 5. What to do next
 
-1. **Try the extension in the real browser.** Copy `extension/` to
-   `~/Downloads` (the Vivaldi Flatpak cannot read the repo), run
-   `~/vsr-venv/bin/python proxy/vsr_proxy.py`, load it unpacked, play a 720p
-   YouTube video and check "Stats for nerds" (codec `avc1…`, a decoded
-   resolution above the selected one) and `window.__vsr.status()` in the
-   console. Watch for: stalls after seeking, quality switches, ads, live.
+1. **Try the extension in the real browser.** It is loaded (see §2); run
+   `~/vsr-venv/bin/python proxy/vsr_proxy.py`, play a 720p YouTube video and
+   check "Stats for nerds" (codec `avc1…`, a decoded resolution above the
+   selected one) and the toolbar popup, which shows the proxy state and the
+   tab's `window.__vsr.status()` counters. Watch for: stalls after seeking,
+   quality switches, ads, live.
    Headless YouTube pauses itself regardless of the extension, so sustained
    playback has only been proven on the local test page.
 2. **NVENC** for the proxy (DESIGN §9f, "State"): the CPU encode is now the
