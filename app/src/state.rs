@@ -24,7 +24,8 @@ pub struct Settings {
     pub target: Option<(u32, u32)>,
     /// Draw the "RTX VSR" indicator on video that is being upscaled.
     pub indicator: bool,
-    /// When launched at login, start with the window minimised.
+    /// When launched at login, start in the tray without a window (with a
+    /// minimised window where the desktop has no tray).
     pub start_minimized: bool,
     pub port: u16,
     /// CUDA device index.

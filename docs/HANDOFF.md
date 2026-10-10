@@ -1,13 +1,10 @@
 # HANDOFF — rtx-vsr-linux on an RTX 2060 SUPER
 
-**Updated:** 2026-10-11, end of the session that replaced the Python proxy
-with the app (Pop!_OS 24.04, GNOME/Wayland, driver 595.104.02, displays
-DP-1 2560×1440 + DP-2 1920×1200).
+**Updated:** 2026-10-11, end of the session that gave the app a tray icon,
+a plainer window and the new indicator (Pop!_OS 24.04, GNOME/Wayland, driver
+595.104.02, displays DP-1 2560×1440 + DP-2 1920×1200).
 **Branch:** `turing-and-mpv` (on top of `main` of github.com/akdnexpat/rtx-vsr-linux).
-**Nothing from this session is committed** — it is all in the working tree:
-`app/` (new), `extension/` (changed), `proxy/` and four of its tests
-(deleted), `install/install_app.sh`, `spike/test_app_proxy.py` (new),
-`spike/test_extension.py`, the docs.
+Everything is committed; nothing is pushed.
 
 ---
 
@@ -17,8 +14,8 @@ DP-1 2560×1440 + DP-2 1920×1200).
 |-------|-------|
 | VSR on Turing | All modes load and run natively (`spike/probe_turing.py` 0–6 ok). |
 | mpv | **Working and installed.** `mpv/vsr.vpy` + `mpv/main.lua` in the stock Flathub mpv; `Alt+v` toggles, `Alt+q` cycles modes. Untouched this session. |
-| The app (`app/`) | **Working.** One Rust binary: the browser path's proxy (NVDEC → VSR → NVENC, all on the GPU, no Python) and an iced window for it. Installed as `~/.local/bin/rtx-vsr`; not started, not connected to any browser, not in autostart — those are yours to switch on. |
-| Browser extension | **Working with the app**, v0.3.0: no settings of its own any more besides the site list; draws the "RTX VSR" indicator. Tested in headless Vivaldi and at the buffering level on YouTube. |
+| The app (`app/`) | **Working.** One Rust binary: the browser path's proxy (NVDEC → VSR → NVENC, all on the GPU, no Python), an iced window for it and a tray icon. Closing the window leaves it in the tray; *Start minimized* starts it there at login. Installed as `~/.local/bin/rtx-vsr`; not started, not connected to any browser, not in autostart — those are yours to switch on. |
+| Browser extension | **Working with the app**, v0.3.0: no settings of its own any more besides the site list; shows the "RTX VSR" indicator (`extension/icons/indicator.png`, 70 % opaque) and tells the app when upscaled video is playing and on which screen. Tested in headless Vivaldi and at the buffering level on YouTube. |
 | Python proxy | **Removed** (`proxy/`, and `spike/test_segment_mse.py`, `test_downshift.py`, `test_policy.py`, `test_proxy_youtube.py`). `spike/test_app_proxy.py` and the app's unit tests cover what they did. |
 | GStreamer (M2), Chromium patch (M4) | Not started. |
 
@@ -37,6 +34,9 @@ Design rationale and the pitfalls behind each piece: `docs/DESIGN.md` §5C
    `vivaldi://extensions` (otherwise both copies relay every segment), and
    `~/Documents/extension` can go.
 4. Optional: *Start at login*, *Start minimized*, *Show RTX VSR indicator*.
+5. A browser that is already connected has to be restarted once to load the
+   extension that came with this session's build (new indicator, the
+   "playing" reports behind the window's note about a smaller display).
 
 ## 3. This machine
 
@@ -52,6 +52,10 @@ Design rationale and the pitfalls behind each piece: `docs/DESIGN.md` §5C
   Must not contain `vapoursynth`.
 - mpv: Flatpak `io.mpv.Mpv` 0.41.0;
   `~/.var/app/io.mpv.Mpv/config/mpv/scripts/rtx-vsr` → symlink to `mpv/`.
+- The tray: GNOME has none of its own. The "AppIndicator and
+  KStatusNotifierItem Support" extension (`appindicatorsupport@rgcjonas.gmail.com`,
+  v66) was installed for this user from extensions.gnome.org on 2026-10-11
+  and is enabled; it lives in `~/.local/share/gnome-shell/extensions/`.
 - Browser: Flatpak `com.vivaldi.Vivaldi` (Chromium 152). Its real profile
   still has the old extension loaded unpacked from `~/Documents/extension`
   (see §2).
@@ -76,13 +80,14 @@ install/install_mpv.sh        # builds ~/vsr-venv-py313, links the mpv script, s
 
 ## 4. Tests
 
-The first four pass at handoff; `install_mpv.sh` was not run again this
-session (nothing it covers changed).
+The first four pass at handoff; `test_vpy.py` and `install_mpv.sh` were not
+run again this session (nothing they cover changed).
 
 ```bash
-(cd app && cargo test && cargo clippy --all-targets)   # 17 unit tests
+(cd app && cargo test && cargo clippy --all-targets)   # 18 unit tests
 ~/vsr-venv/bin/python spike/test_app_proxy.py          # proxy vs. MSE: timing, colour, caps
 ~/vsr-venv/bin/python spike/test_extension.py          # extension + app in headless Vivaldi
+~/vsr-venv/bin/python spike/test_tray.py               # tray icon, close to tray, start minimized
 ~/vsr-venv/bin/python -W ignore spike/test_vpy.py      # mpv filter colour math + fps
 install/install_mpv.sh                                 # ends with a real mpv run
 ```
@@ -92,7 +97,9 @@ The two end-to-end tests start their own copy of the app on ports 8742 and
 `test_extension.py` also uses a page server on 8731 and DevTools on 9333,
 starts the browser with the command line of the launcher override that
 `rtx-vsr --connect` writes (into a throwaway home), and cleans up after
-itself.
+itself. `test_tray.py` (port 8745) runs the app under XWayland, where a
+script can see and close windows, and plays the desktop's tray over D-Bus;
+the app's windows show up on screen for a moment while it runs.
 
 To look at the window without touching your own settings or launchers:
 
@@ -130,8 +137,16 @@ XDG_CONFIG_HOME=/tmp/x/config XDG_DATA_HOME=/tmp/x/data \
 - **Headless YouTube pauses itself**, with or without the extension, and
   picks 240p; sustained playback can only be judged in a real window.
 - **GNOME on Wayland gives no way to inspect windows** from a script
-  (`Shell.Introspect` is denied). Minimising was checked under XWayland with
-  `xprop` and on Wayland by tracing the protocol (`WAYLAND_DEBUG=1`).
+  (`Shell.Introspect` is denied). Window behaviour is checked under XWayland
+  (`WAYLAND_DISPLAY=` in the app's environment) with `xwininfo`/`xprop` and a
+  `WM_DELETE_WINDOW` message for the close button, and on Wayland by tracing
+  the protocol (`WAYLAND_DEBUG=1`).
+- **ksni does not call `watcher_online` for a tray that is already there** at
+  start, only for one that appears later; the app assumes a tray until
+  `watcher_offline` says otherwise.
+- **A GNOME extension installed from a zip is not seen until the next login**
+  on Wayland. `org.gnome.Shell.Extensions.InstallRemoteExtension` over D-Bus
+  makes the running shell fetch and load it (it asks on screen first).
 - Output sizes need only be even with nvidia-vfx 0.2.0.0, and fractional
   factors work; the model stops at 4×.
 
@@ -140,9 +155,9 @@ XDG_CONFIG_HOME=/tmp/x/config XDG_DATA_HOME=/tmp/x/data \
 1. **Use it for real**: a long YouTube session in a normal window — seeking,
    quality switches, ads, live streams, a video dragged from one display to
    the other. Watch the window's "Last upscaled" line and the indicator.
-2. **A tray icon** (StatusNotifierItem) so that the app can run without a
-   window where the desktop has a tray; this GNOME session has none, which is
-   why "Start minimized" minimises and closing the window quits.
+2. **Look at the tray icon and the window with your own eyes**: the tests
+   prove the behaviour, not the looks. The icon is the green app mark at
+   64 px, scaled by the panel.
 3. **VP9 through NVDEC** (Turing decodes it): the extension could then stop
    steering players to H.264, which caps YouTube sources at 1080p.
 4. **Packaging**: a release binary on GitHub, or a Flatpak, so that building

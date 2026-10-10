@@ -136,7 +136,7 @@ Then, in the window:
 | Upscale to | Resolution to upscale to. The list ends at your largest display's resolution. With several displays, video playing on a smaller one is upscaled only to *that* display's resolution. |
 | Quality | Low … Ultra (the model's four modes). Stepped down by itself when GPU memory is short or the card cannot keep up with playback. |
 | Show RTX VSR indicator | Draws an "RTX VSR" mark in the top right corner of a video while the frames on screen are upscaled ones. |
-| Start at login | Starts the app with your session. *Start minimized* (shown once this is on) keeps the window out of the way then. |
+| Start at login | Starts the app with your session. *Start minimized* (shown once this is on) then starts it in the tray without opening the window; on a desktop without a tray the window is opened minimized instead. |
 
 The app upscales for as long as it runs. Closing the window leaves it running
 in the tray: a click on the icon (or starting the app a second time) brings

@@ -46,6 +46,9 @@ const BOLD: Font = Font {
 };
 
 const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-64.rgba");
+/// How many ticks (ten seconds) an app started minimised at login waits for
+/// the desktop's tray to appear before it settles for a minimised window.
+const TRAY_GRACE: u64 = 20;
 /// Size of the runtime download, for the button's label.
 const DOWNLOAD_MB: u32 = 423;
 
@@ -53,6 +56,7 @@ pub struct Options {
     pub shared: Arc<Shared>,
     /// Why the proxy is not listening, if it is not.
     pub listening: Result<(), String>,
+    /// Start in the tray, without a window.
     pub start_minimized: bool,
     /// Developer aid: save a picture of the window here, then quit.
     pub screenshot: Option<std::path::PathBuf>,
@@ -136,6 +140,8 @@ struct App {
     shared: Arc<Shared>,
     listening: Result<(), String>,
     window: Option<window::Id>,
+    /// Started minimised and not seen a tray yet: if a window has to be
+    /// opened for want of one, it is to be minimised.
     minimize_when_open: bool,
     settings: Settings,
     monitors: Vec<Monitor>,
@@ -200,7 +206,11 @@ impl App {
             screenshot: options.screenshot,
         };
         app.scan_browsers();
-        let open = app.open_window();
+        let open = if app.minimize_when_open {
+            Task::none() // the tray icon is all there is to see
+        } else {
+            app.open_window()
+        };
         (app, open)
     }
 
@@ -278,12 +288,17 @@ impl App {
                 if let (Some(_), Some(id), 4) = (&self.screenshot, self.window, self.ticks) {
                     return window::screenshot(id).map(Message::Shot);
                 }
-                if self.window.is_none() && !self.shared.tray.load(Ordering::Relaxed) {
-                    // The tray went away while the app was in it.
+                if self.shared.tray.load(Ordering::Relaxed) {
+                    self.minimize_when_open = false;
+                } else if self.window.is_none()
+                    && (!self.minimize_when_open || self.ticks >= TRAY_GRACE)
+                {
+                    // No tray to be in: it went away, or at login never came.
                     return self.open_window();
                 }
             }
             Message::Request(Request::Show) => {
+                self.minimize_when_open = false;
                 // Asked for through the tray or by being launched again: a new
                 // window is the one thing every desktop will put in front
                 // of the user.
@@ -510,9 +525,14 @@ impl App {
         )]
         .spacing(14);
         if self.autostart {
+            let how = if self.shared.tray.load(Ordering::Relaxed) {
+                "At login, start in the tray without opening the window."
+            } else {
+                "At login, start in the tray, or as a minimized window where there is no tray."
+            };
             card = card.push(switch(
                 "Start minimized",
-                "At login, keep the window out of the way.",
+                how,
                 self.settings.start_minimized,
                 Message::StartMinimized,
             ));

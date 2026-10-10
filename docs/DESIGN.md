@@ -564,9 +564,9 @@ inside the video's offset parent, which keeps it under the player's own
 controls and inside whatever goes fullscreen.
 
 **The window** is an iced daemon with one window, software-rendered
-(tiny-skia): a settings panel does not need a second GPU context. "Start
-minimized" minimises the window at login; a second launch opens a new window
-instead of trying to raise the old one, which Wayland does not allow.
+(tiny-skia): a settings panel does not need a second GPU context. A second
+launch opens a new window instead of trying to raise the old one, which
+Wayland does not allow.
 
 **The tray icon** is a StatusNotifierItem (the `ksni` crate, pure Rust over
 D-Bus, so no GTK or libappindicator to link). While the desktop has a
@@ -575,6 +575,10 @@ one the icon would be nowhere, so closing quits as before, and if the watcher
 disappears while the app sits in the tray the window is opened again. The
 icon's thread and later launches reach the window's thread through one
 channel that is an iced subscription (`ui::request`), not by being polled.
+"Start minimized" starts the app at login with the icon only. A login can
+get to the app before the desktop's tray exists, so it waits ten seconds for
+one and only then falls back to what it did before there was an icon: a
+minimised window.
 
 Open: long sessions on YouTube in a normal window (quality switches, ads,
 live), VP9 through NVDEC (Turing
