@@ -525,7 +525,12 @@ class Handler(BaseHTTPRequestHandler):
         server doesn't), so it hands us raw segment bytes and we transform them.
         This is resilient to YouTube's Server ABR 403s: we never fetch, we only
         upscale what the already-authorized client gave us. Body = media bytes;
-        query carries mode/scale/strict like /upscale."""
+        query carries mode/scale/strict like /upscale.
+
+        Use ?mse=1 for the MSE-correct path (vsr_segment.transform_segment):
+        timestamp-preserving, fragmented-MP4 output that is safe to append to
+        a video/mp4 SourceBuffer. Default (mse=0) keeps the legacy whole-clip
+        re-encode behavior."""
         import json
         u = urlparse(self.path)
         q = parse_qs(u.query)
@@ -541,6 +546,26 @@ class Handler(BaseHTTPRequestHandler):
             mode = int(q.get("mode", ["2"])[0])
             scale = float(q.get("scale", ["1.5"])[0])
             strict = q.get("strict", ["0"])[0] in ("1", "true")
+            mse = q.get("mse", ["0"])[0] in ("1", "true")
+            t0 = time.perf_counter()
+            if mse:
+                if not GPU["ready"]:
+                    self._send(503, "GPU not ready: %s" % GPU.get("err"))
+                    return
+                import vsr_segment
+                data, meta = vsr_segment.transform_segment(
+                    raw, mode=mode, scale=scale,
+                    max_h=POLICY["max_out_h"], gpu=GPU["gpu_index"],
+                    strict=strict)
+                if data is None:
+                    self._send(200, raw, "application/octet-stream", extra={
+                        "X-VSR-Meta": json.dumps(meta or {})})
+                    return
+                self._send(200, data, "video/mp4", extra={
+                    "X-VSR-Meta": json.dumps(meta),
+                    "X-VSR-Elapsed-S": f"{time.perf_counter()-t0:.2f}",
+                })
+                return
             import tempfile
             fd, path = tempfile.mkstemp(suffix=".seg")
             with os.fdopen(fd, "wb") as f:

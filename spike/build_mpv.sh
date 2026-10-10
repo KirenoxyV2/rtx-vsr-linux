@@ -44,7 +44,7 @@ build)
     --prefix=/opt/mpv-vsr \
     -Dvapoursynth=enabled \
     -Dlibmpv=true \
-    -Dhtml-build=disabled -Dmanpages-build=disabled
+    -Dhtml-build=disabled -Dmanpage-build=disabled
 
   echo "== compile =="
   ninja -C builddir
