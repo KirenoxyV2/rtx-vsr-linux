@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::display::Monitor;
+use crate::display::{Monitor, Screen};
 
 pub const APP_ID: &str = "rtx-vsr";
 pub const DEFAULT_PORT: u16 = 8730;
@@ -130,6 +130,9 @@ pub struct Stats {
     pub slowed_to: Option<u8>,
     /// When the browser extension last talked to us.
     pub extension_at: Option<Instant>,
+    /// The screen of the page that last said it has upscaled video playing,
+    /// and when it said so.
+    pub watching: Option<(Screen, Instant)>,
 }
 
 pub struct Shared {

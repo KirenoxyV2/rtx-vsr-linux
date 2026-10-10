@@ -83,11 +83,16 @@ function updateConfig(change) {
   return writing;
 }
 
-// The app's own settings (GET /config), or null when it is not running.
-async function appConfig() {
+// The screen a page is on, as the app's query parameters.
+const screenQuery = (s) => (s && s.w && s.h ? `sw=${s.w}&sh=${s.h}&dpr=${s.dpr || 1}` : "");
+
+// The app's own settings (GET /config), or null when it is not running. A
+// page that has upscaled video playing says so along the way.
+async function appConfig(msg) {
   const cfg = await getConfig();
+  const where = msg.playing ? screenQuery(msg.screen) : "";
   try {
-    const r = await fetch(cfg.proxy + "/config", { cache: "no-store" });
+    const r = await fetch(cfg.proxy + "/config" + (where && "?playing=1&" + where), { cache: "no-store" });
     return r.ok ? await r.json() : null;
   } catch (_) { return null; }
 }
@@ -116,9 +121,8 @@ async function transform(msg) {
   const body = Uint8Array.fromBase64 ? Uint8Array.fromBase64(msg.body)
     : Uint8Array.from(atob(msg.body), (c) => c.charCodeAt(0));
   // The screen the page is on: the app never upscales past what it can show.
-  const s = msg.screen || {};
-  const query = s.w && s.h ? `?sw=${s.w}&sh=${s.h}&dpr=${s.dpr || 1}` : "";
-  const r = await fetch(`${cfg.proxy}/transform${query}`, { method: "POST", body });
+  const where = screenQuery(msg.screen);
+  const r = await fetch(`${cfg.proxy}/transform${where && "?" + where}`, { method: "POST", body });
   let meta = null;
   try { meta = JSON.parse(r.headers.get("X-VSR-Meta")); } catch (_) {}
   if (r.status === 204) return { ok: false, passthrough: true, meta };

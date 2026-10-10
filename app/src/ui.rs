@@ -23,6 +23,7 @@ use crate::display::{self, Monitor};
 use crate::engine::pipeline::MODE_NAMES;
 use crate::engine::runtime;
 use crate::gpu::nvml::{self, GpuInfo};
+use crate::server::WATCHING_FOR;
 use crate::state::{Runtime, Settings, Shared, Stats, APP_ID};
 
 const GREEN: Color = Color::from_rgb8(0x76, 0xb9, 0x00);
@@ -461,18 +462,19 @@ impl App {
             ),
         ]
         .spacing(14);
-        // Smaller displays: say what happens to video shown on them.
-        let mut smaller: Vec<String> = self
-            .monitors
-            .iter()
-            .filter(|m| m.width < target.0 || m.height < target.1)
-            .map(|m| format!("{} ({})", m.name, display::label((m.width, m.height))))
-            .collect();
-        smaller.dedup();
-        if !smaller.is_empty() {
+        // While video is playing on a smaller display, say what happens to it.
+        let watched = self
+            .stats
+            .watching
+            .filter(|(_, at)| at.elapsed() < WATCHING_FOR)
+            .and_then(|(screen, _)| {
+                display::held_back(self.settings.target, &self.monitors, screen)
+            });
+        if let Some((monitor, size)) = watched {
             card = card.push(hint(format!(
-                "Video playing on {} is upscaled to that display's resolution instead.",
-                smaller.join(" or ")
+                "The video playing on {} is upscaled to {}, that display's resolution.",
+                monitor.name,
+                display::label(size)
             )));
         }
         card = card

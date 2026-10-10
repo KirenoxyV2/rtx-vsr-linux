@@ -375,6 +375,10 @@ async def main():
             proxy = start_app(app, config, indicator=True)
             ok &= check("64 kB pieces + indicator ", await run_page(cdp, page + "&piece=65536&mark=1"),
                         n, True, expect_mark=True)
+            # the page was playing upscaled video until a moment ago, and said so
+            watching = json.loads(wait_http(f"http://127.0.0.1:{PROXY_PORT}/status"))["watching"]
+            print(f"app told that upscaled video is playing: {watching}")
+            ok &= watching
             await cdp.call("Browser.close")
 
         st = json.loads(wait_http(f"http://127.0.0.1:{PROXY_PORT}/status"))

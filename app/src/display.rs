@@ -114,6 +114,18 @@ pub fn target_for(
     }
 }
 
+/// The display a page on `screen` is on and what video is upscaled to
+/// there, if that is less than the chosen resolution.
+pub fn held_back(
+    chosen: Option<(u32, u32)>,
+    monitors: &[Monitor],
+    screen: Screen,
+) -> Option<(&Monitor, (u32, u32))> {
+    let monitor = find(monitors, screen)?;
+    let size = target_for(chosen, monitors, Some(screen));
+    (size != target(chosen, monitors)).then_some((monitor, size))
+}
+
 pub fn label(size: (u32, u32)) -> String {
     format!("{} × {}", size.0, size.1)
 }
@@ -236,6 +248,28 @@ mod tests {
         assert_eq!(target_for(None, &two, on(800.0, 600.0)), (2560, 1440));
         // a choice left over from a larger display that is gone
         assert_eq!(target_for(Some((3840, 2160)), &two, None), (2560, 1440));
+    }
+
+    #[test]
+    fn only_a_smaller_display_holds_video_back() {
+        let two = [monitor("A", 2560, 1440, 1.0), monitor("B", 1920, 1200, 1.0)];
+        let on = |w, h| Screen {
+            width: w,
+            height: h,
+            dpr: 1.0,
+        };
+        assert_eq!(held_back(None, &two, on(2560.0, 1440.0)), None);
+        assert_eq!(
+            held_back(None, &two, on(1920.0, 1200.0)),
+            Some((&two[1], (1920, 1200)))
+        );
+        // a choice that fits the smaller display too
+        assert_eq!(
+            held_back(Some((1920, 1080)), &two, on(1920.0, 1200.0)),
+            None
+        );
+        // a screen that is none of the displays
+        assert_eq!(held_back(None, &two, on(800.0, 600.0)), None);
     }
 
     #[test]

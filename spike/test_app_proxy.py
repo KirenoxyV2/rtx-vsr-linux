@@ -260,6 +260,11 @@ def main():
         status, out, meta = post(init + chunks[0])
         expect("and the proxy still works afterwards", status, 200)
 
+        # A page says upscaled video is playing by adding its screen to /config.
+        expect("nothing is said to be playing", get("/status")["watching"], False)
+        get("/config?playing=1&sw=1920&sh=1080&dpr=1")
+        expect("a page's word that video is playing is kept", get("/status")["watching"], True)
+
         st = get("/status")
         print(f"status: {st['total_transforms']} segments, {st['total_frames']} frames, "
               f"last {st['last_in']} -> {st['last_out']} {st['last_mode']}, {st['fps'] or 0:.0f} fps")

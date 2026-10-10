@@ -79,12 +79,13 @@
         resolve({ failed: true });
       }, TIMEOUT_MS);
       waiting.set(id, { resolve, timer });
-      // The screen this window is on, in CSS pixels: the app caps the output
-      // to that display's resolution.
-      const scr = { w: screen.width, h: screen.height, dpr: window.devicePixelRatio || 1 };
-      window.postMessage({ __vsr: "req", id, screen: scr, body: bytes.buffer }, "*", [bytes.buffer]);
+      window.postMessage({ __vsr: "req", id, screen: screenInfo(), body: bytes.buffer }, "*", [bytes.buffer]);
     });
   }
+
+  // The screen this window is on, in CSS pixels: the app caps the output to
+  // that display's resolution.
+  const screenInfo = () => ({ w: screen.width, h: screen.height, dpr: window.devicePixelRatio || 1 });
 
   // ---- bytes helpers --------------------------------------------------------
   function toBytes(data) {   // always a private copy: the page may reuse its buffer
@@ -402,16 +403,26 @@
     });
   }
 
-  let watching = false, ticks = 0;
+  let watching = false, ticks = 0, wasPlaying = false;
   function watchVideos() {         // started by the first upscaled fragment
     if (watching) return;
     watching = true;
     setInterval(() => {
-      // The app's setting may change while nothing is being appended.
-      if (ticks++ % 4 === 0) window.postMessage({ __vsr: "cfg" }, "*");
+      let playing = false;
       for (const video of document.querySelectorAll("video")) {
-        try { placeMark(video); } catch (_) {}
+        try {
+          placeMark(video);
+          playing = playing || (!document.hidden && !video.paused && !video.ended && upscaled(video));
+        } catch (_) {}
       }
+      // Ask for the app's settings now and then (they may change while
+      // nothing is being appended), and tell it whether upscaled video is
+      // playing here and on which screen: its window mentions a smaller
+      // display only while something is being watched on one.
+      if (ticks++ % 4 === 0 || playing !== wasPlaying) {
+        window.postMessage({ __vsr: "cfg", playing, screen: screenInfo() }, "*");
+      }
+      wasPlaying = playing;
     }, 500);
   }
 

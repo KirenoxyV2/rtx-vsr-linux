@@ -4,7 +4,9 @@
 //!        200  upscaled fMP4; the first X-VSR-Init-Length bytes are its init
 //!             segment, X-VSR-Meta describes what was done
 //!        204  leave the original alone (X-VSR-Meta says why)
-//!   GET  /config   what the extension needs to know about the app's settings
+//!   GET  /config   what the extension needs to know about the app's settings;
+//!        with ?playing=1&sw=&sh=&dpr= the page also reports that upscaled
+//!        video is playing on that screen
 //!   GET  /health   liveness, for the extension's popup
 //!   GET  /status   what the pipeline has been doing
 //!
@@ -29,6 +31,9 @@ const THREADS: usize = 4;
 const MAX_BODY: usize = 256 << 20;
 /// "Active" in /status for this long after a fragment was upscaled.
 const ACTIVE_FOR: Duration = Duration::from_secs(5);
+/// Upscaled video counts as playing for this long after a page said so
+/// (pages repeat it every two seconds).
+pub const WATCHING_FOR: Duration = Duration::from_secs(5);
 
 pub fn start(shared: Arc<Shared>, engine: Arc<Engine>, port: u16) -> Result<(), String> {
     let server = Server::http(("127.0.0.1", port)).map_err(|e| {
@@ -77,6 +82,18 @@ fn query(url: &str, name: &str) -> Option<f64> {
             None
         }
     })
+}
+
+/// The screen of the page a request is made for, if it says.
+fn screen(url: &str) -> Option<Screen> {
+    match (query(url, "sw"), query(url, "sh"), query(url, "dpr")) {
+        (Some(width), Some(height), dpr) => Some(Screen {
+            width,
+            height,
+            dpr: dpr.unwrap_or(1.0),
+        }),
+        _ => None,
+    }
 }
 
 struct Reply {
@@ -133,7 +150,7 @@ fn handle(mut request: Request, shared: &Shared, engine: &Engine, port: u16) {
             (Method::Options, _) => Reply::text(204, ""),
             (Method::Get, "/") => Reply::text(200, "RTX VSR is running.\n"),
             (Method::Get, "/health") => health(shared),
-            (Method::Get, "/config") => config(shared),
+            (Method::Get, "/config") => config(&url, shared),
             (Method::Get, "/status") => status(shared),
             (Method::Post, "/transform") => transform(&mut request, &url, shared, engine),
             _ => Reply::text(404, "not found"),
@@ -193,7 +210,12 @@ fn health(shared: &Shared) -> Reply {
     }))
 }
 
-fn config(shared: &Shared) -> Reply {
+fn config(url: &str, shared: &Shared) -> Reply {
+    if query(url, "playing") == Some(1.0) {
+        if let Some(screen) = screen(url) {
+            shared.stats.lock().unwrap().watching = Some((screen, Instant::now()));
+        }
+    }
     let settings = shared.settings();
     let monitors = shared.monitors.lock().unwrap().clone();
     let target = display::target(settings.target, &monitors);
@@ -214,6 +236,7 @@ fn status(shared: &Shared) -> Reply {
     let last = stats.last.as_ref();
     Reply::json(json!({
         "active": stats.last_at.is_some_and(|t| t.elapsed() < ACTIVE_FOR),
+        "watching": stats.watching.is_some_and(|(_, t)| t.elapsed() < WATCHING_FOR),
         "gpu": stats.gpu,
         "error": stats.error,
         "skipped": stats.skipped,
@@ -257,15 +280,11 @@ fn transform(request: &mut Request, url: &str, shared: &Shared, engine: &Engine)
         return Reply::text(400, "could not read the request body");
     }
 
-    let screen = match (query(url, "sw"), query(url, "sh"), query(url, "dpr")) {
-        (Some(width), Some(height), dpr) => Some(Screen {
-            width,
-            height,
-            dpr: dpr.unwrap_or(1.0),
-        }),
-        _ => None,
-    };
-    let target = display::target_for(settings.target, &shared.monitors.lock().unwrap(), screen);
+    let target = display::target_for(
+        settings.target,
+        &shared.monitors.lock().unwrap(),
+        screen(url),
+    );
 
     match engine.transform(data, settings.quality, target) {
         Ok(Outcome::Passthrough { why, src }) => skip(&why, src),

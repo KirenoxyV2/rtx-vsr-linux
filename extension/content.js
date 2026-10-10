@@ -39,7 +39,7 @@
     if (m.__vsr === "cfg") {
       // The app's settings and the picture, for the on-video indicator.
       try {
-        chrome.runtime.sendMessage({ type: "appConfig" }, (res) => {
+        chrome.runtime.sendMessage({ type: "appConfig", playing: !!m.playing, screen: m.screen }, (res) => {
           void chrome.runtime.lastError;
           window.postMessage({ __vsr: "cfgres", config: res || null,
                                mark: chrome.runtime.getURL("icons/indicator.png") }, "*");
