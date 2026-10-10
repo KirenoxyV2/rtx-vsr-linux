@@ -22,7 +22,7 @@ $("save").addEventListener("click", async () => {
     sites,
   };
   await chrome.storage.local.set({ vsrConfig: cfg });
-  $("status").textContent = "Saved — reload open tabs to apply.";
+  $("status").textContent = "Saved. Reload open tabs to apply.";
 });
 
 load();

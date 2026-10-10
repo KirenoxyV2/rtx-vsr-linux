@@ -9,8 +9,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use iced::overlay::menu;
 use iced::widget::{
-    button, column, container, pick_list, progress_bar, row, scrollable, space, text, toggler,
+    button, column, container, pick_list, progress_bar, row, rule, scrollable, text, toggler,
 };
 use iced::window;
 use iced::{
@@ -27,9 +28,12 @@ use crate::server::WATCHING_FOR;
 use crate::state::{Runtime, Settings, Shared, Stats, APP_ID};
 
 const GREEN: Color = Color::from_rgb8(0x76, 0xb9, 0x00);
-const SURFACE: Color = Color::from_rgb8(0x1a, 0x1f, 0x19);
-const OUTLINE: Color = Color::from_rgb8(0x2c, 0x35, 0x2a);
-const MUTED: Color = Color::from_rgb8(0x9a, 0xa5, 0x96);
+const BACKGROUND: Color = Color::from_rgb8(0x1e, 0x1e, 0x1e);
+const TEXT: Color = Color::from_rgb8(0xec, 0xec, 0xec);
+const MUTED: Color = Color::from_rgb8(0x9a, 0x9a, 0x9a);
+/// Dividers, and the fill of buttons and lists.
+const LINE: Color = Color::from_rgb8(0x3a, 0x3a, 0x3a);
+const FIELD: Color = Color::from_rgb8(0x2d, 0x2d, 0x2d);
 const AMBER: Color = Color::from_rgb8(0xe3, 0xa0, 0x2f);
 const RED: Color = Color::from_rgb8(0xe5, 0x5b, 0x4d);
 const BOLD: Font = Font {
@@ -65,7 +69,6 @@ pub enum Message {
     ShowExtension,
     DownloadRuntime,
     Shot(window::Screenshot),
-    Quit,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,10 +89,10 @@ pub struct Quality(u8);
 impl fmt::Display for Quality {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self.0 {
-            1 => "Low — fastest",
+            1 => "Low (fastest)",
             2 => "Medium",
             3 => "High",
-            _ => "Ultra — sharpest, slowest",
+            _ => "Ultra (sharpest, slowest)",
         })
     }
 }
@@ -131,8 +134,8 @@ fn theme() -> Theme {
     Theme::custom(
         "RTX VSR",
         iced::theme::Palette {
-            background: Color::from_rgb8(0x11, 0x14, 0x10),
-            text: Color::from_rgb8(0xe9, 0xed, 0xe6),
+            background: BACKGROUND,
+            text: TEXT,
             primary: GREEN,
             success: GREEN,
             warning: AMBER,
@@ -315,7 +318,6 @@ impl App {
                 }
                 return iced::exit();
             }
-            Message::Quit => return iced::exit(),
         }
         Task::none()
     }
@@ -334,7 +336,7 @@ impl App {
             Runtime::Downloading { .. } | Runtime::Unpacking => return ("Setting up", AMBER, None),
             _ => {
                 let why =
-                    "The NVIDIA runtime is needed before video can be upscaled — see Status below.";
+                    "The NVIDIA runtime is needed before video can be upscaled. See Status below.";
                 return ("Setup needed", AMBER, Some(why.into()));
             }
         }
@@ -357,49 +359,17 @@ impl App {
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
         let (state, colour, detail) = self.headline();
 
-        let logo = container(
-            column![
-                text("RTX").size(13).font(BOLD),
-                text("VSR").size(13).font(BOLD)
-            ]
-            .align_x(Center),
-        )
-        .center(44)
-        .style(|_| container::Style {
-            background: Some(Background::Color(GREEN)),
-            text_color: Some(Color::WHITE),
-            border: Border {
-                radius: 9.0.into(),
-                ..Border::default()
-            },
-            ..container::Style::default()
-        });
-        let pill = container(text(state).size(13).font(BOLD))
-            .padding([4, 12])
-            .style(move |_| container::Style {
-                background: Some(Background::Color(Color { a: 0.16, ..colour })),
-                text_color: Some(colour),
-                border: Border {
-                    radius: 99.0.into(),
-                    width: 1.0,
-                    color: Color { a: 0.5, ..colour },
-                },
-                ..container::Style::default()
-            });
         let header = row![
-            logo,
-            column![
-                text("RTX Video Super Resolution").size(17).font(BOLD),
-                hint("AI upscaling for browser video")
-            ]
-            .spacing(1)
-            .width(Fill),
-            pill,
+            text("RTX Video Super Resolution")
+                .size(17)
+                .font(BOLD)
+                .width(Fill),
+            text(state).size(14).font(BOLD).color(colour),
         ]
         .spacing(12)
         .align_y(Center);
 
-        let mut page = column![header].spacing(14).padding(18);
+        let mut page = column![header].spacing(18).padding(20);
         if let Some(detail) = detail {
             page = page.push(text(detail).size(13).color(colour));
         }
@@ -412,14 +382,9 @@ impl App {
             .push(self.browser_card())
             .push(self.status())
             .push(
-                row![
-                    hint(format!("Version {}", env!("CARGO_PKG_VERSION"))),
-                    space::horizontal(),
-                    button(text("Quit").size(13))
-                        .style(button::secondary)
-                        .on_press(Message::Quit),
-                ]
-                .align_y(Center),
+                container(hint(format!("Version {}", env!("CARGO_PKG_VERSION"))))
+                    .center_x(Fill)
+                    .padding([4, 0]),
             );
         scrollable(page).height(Fill).into()
     }
@@ -436,9 +401,8 @@ impl App {
                     .map(|m| m.name.as_str())
                     .collect();
                 let note = match (size == max, on.is_empty()) {
-                    (true, true) => " — display".to_string(),
-                    (true, false) => format!(" — {} (maximum)", on.join(", ")),
-                    (false, false) => format!(" — {}", on.join(", ")),
+                    (true, true) => " (display)".to_string(),
+                    (_, false) => format!(" ({})", on.join(", ")),
                     (false, true) => String::new(),
                 };
                 Resolution { size, note }
@@ -456,9 +420,7 @@ impl App {
             ),
             setting(
                 "Upscale to",
-                pick_list(choices, selected, Message::Target)
-                    .width(250)
-                    .text_size(14)
+                dropdown(pick_list(choices, selected, Message::Target))
             ),
         ]
         .spacing(14);
@@ -480,13 +442,11 @@ impl App {
         card = card
             .push(setting(
                 "Quality",
-                pick_list(
+                dropdown(pick_list(
                     QUALITIES,
                     Some(Quality(self.settings.quality)),
                     Message::Quality,
-                )
-                .width(250)
-                .text_size(14),
+                )),
             ))
             .push(switch(
                 "Show RTX VSR indicator",
@@ -528,7 +488,7 @@ impl App {
                 (false, _) => {
                     "Loads the extension each time the browser starts. No developer mode needed."
                 }
-                (true, true) => "Connected — the extension is loaded.",
+                (true, true) => "Connected. The extension is loaded.",
                 (true, false) => "Restart the browser to finish connecting.",
             };
             card = card.push(switch(
@@ -547,7 +507,7 @@ impl App {
             row![
                 hint(seen).width(Fill),
                 button(text("Extension folder").size(13))
-                    .style(button::secondary)
+                    .style(flat)
                     .on_press(Message::ShowExtension),
             ]
             .spacing(12)
@@ -589,7 +549,7 @@ impl App {
                 column![
                     fact("NVIDIA runtime", "Not installed".to_string()),
                     hint(why),
-                    button(text(format!("Download ({DOWNLOAD_MB} MB)")).size(14)).on_press(Message::DownloadRuntime),
+                    button(text(format!("Download ({DOWNLOAD_MB} MB)")).size(14)).style(flat).on_press(Message::DownloadRuntime),
                 ]
                 .spacing(8)
                 .into()
@@ -608,8 +568,8 @@ impl App {
                 );
                 if l.mode < l.requested {
                     line += match self.stats.slowed_to {
-                        Some(_) => " — quality lowered to keep up",
-                        None => " — quality lowered to fit GPU memory",
+                        Some(_) => ", quality lowered to keep up",
+                        None => ", quality lowered to fit GPU memory",
                     };
                 }
                 line
@@ -644,20 +604,68 @@ fn hint<'a>(content: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
     text(content).size(12).color(MUTED)
 }
 
+/// A group of settings under a dividing line that carries its name.
 fn section<'a>(title: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(column![text(title).size(12).font(BOLD).color(GREEN), body.into()].spacing(12))
-        .padding(16)
-        .width(Fill)
-        .style(|_| container::Style {
-            background: Some(Background::Color(SURFACE)),
-            border: Border {
-                radius: 12.0.into(),
-                width: 1.0,
-                color: OUTLINE,
-            },
-            ..container::Style::default()
+    let line = || {
+        rule::horizontal(1).style(|_| rule::Style {
+            color: LINE,
+            radius: 0.0.into(),
+            fill_mode: rule::FillMode::Full,
+            snap: true,
         })
-        .into()
+    };
+    column![
+        row![line(), text(title).size(12).color(MUTED), line()]
+            .spacing(12)
+            .align_y(Center),
+        body.into()
+    ]
+    .spacing(14)
+    .into()
+}
+
+fn fill(hovered: bool) -> Background {
+    Background::Color(if hovered { LINE } else { FIELD })
+}
+
+/// The look of buttons: a plain filled shape.
+fn flat(_: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(fill(matches!(
+            status,
+            button::Status::Hovered | button::Status::Pressed
+        ))),
+        text_color: TEXT,
+        border: Border::default().rounded(6),
+        ..button::Style::default()
+    }
+}
+
+/// The look of lists to choose from: as plain as the buttons.
+fn dropdown<'a, T, L>(
+    list: pick_list::PickList<'a, T, L, T, Message>,
+) -> pick_list::PickList<'a, T, L, T, Message>
+where
+    T: ToString + PartialEq + Clone + 'a,
+    L: std::borrow::Borrow<[T]> + 'a,
+{
+    list.width(250)
+        .text_size(14)
+        .style(|_, status| pick_list::Style {
+            text_color: TEXT,
+            placeholder_color: MUTED,
+            handle_color: MUTED,
+            background: fill(!matches!(status, pick_list::Status::Active)),
+            border: Border::default().rounded(6),
+        })
+        .menu_style(|_| menu::Style {
+            background: Background::Color(FIELD),
+            border: Border::default().rounded(6),
+            text_color: TEXT,
+            selected_text_color: TEXT,
+            selected_background: Background::Color(LINE),
+            shadow: iced::Shadow::default(),
+        })
 }
 
 /// A labelled on/off switch with a line of explanation.

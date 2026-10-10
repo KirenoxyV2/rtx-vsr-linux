@@ -214,7 +214,7 @@
         } else {
           if (res.failed && ++stats.failures >= MAX_FAILURES) {
             stats.off = true;
-            console.warn("[vsr] the RTX VSR app keeps failing — passing video through until reload");
+            console.warn("[vsr] the RTX VSR app keeps failing: passing video through until reload");
           }
           if (st.ours) {         // back to the page's own stream description
             out.push(st.init);

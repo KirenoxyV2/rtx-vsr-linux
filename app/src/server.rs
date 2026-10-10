@@ -42,7 +42,7 @@ pub fn start(shared: Arc<Shared>, engine: Arc<Engine>, port: u16) -> Result<(), 
             .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse);
         if in_use {
             format!(
-                "Port {port} is taken by another program — if the old Python proxy (vsr_proxy.py) \
+                "Port {port} is taken by another program. If the old Python proxy (vsr_proxy.py) \
                  is still running, stop it and start RTX VSR again."
             )
         } else {
@@ -192,9 +192,7 @@ fn health(shared: &Shared) -> Reply {
     );
     let err = match (&gpu, runtime) {
         (Err(e), _) => Some(e.clone()),
-        (_, false) => {
-            Some("the NVIDIA runtime is not installed — open the RTX VSR app".to_string())
-        }
+        (_, false) => Some("the NVIDIA runtime is not installed: open the RTX VSR app".to_string()),
         _ => stats.error,
     };
     let gpu = gpu.unwrap_or_default();

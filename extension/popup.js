@@ -38,9 +38,9 @@ async function showPageState(tabId) {
   const el = $("pageState");
   el.hidden = false;
   if (!st) {
-    el.textContent = "Not active in this tab yet — reload the page.";
+    el.textContent = "Not active in this tab yet. Reload the page.";
   } else if (st.off) {
-    el.textContent = "Switched itself off in this tab after repeated failures — reload to retry.";
+    el.textContent = "Switched itself off in this tab after repeated failures. Reload to retry.";
   } else if (!st.transformed) {
     el.textContent = st.passthrough
       ? `Nothing upscaled yet (${st.passthrough} segments passed through).`

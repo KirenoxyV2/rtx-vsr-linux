@@ -16,7 +16,7 @@ use std::sync::Arc;
 use state::{Runtime, Settings, Shared};
 
 const USAGE: &str = "\
-RTX VSR — AI upscaling for browser video on NVIDIA RTX cards
+RTX VSR: AI upscaling for browser video on NVIDIA RTX cards
 
 Usage: rtx-vsr [options]
 
