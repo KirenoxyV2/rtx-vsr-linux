@@ -9,6 +9,7 @@ mod gpu;
 mod instance;
 mod server;
 mod state;
+mod tray;
 mod ui;
 
 use std::sync::Arc;
@@ -20,7 +21,8 @@ RTX VSR: AI upscaling for browser video on NVIDIA RTX cards
 
 Usage: rtx-vsr [options]
 
-  (no options)     open the window; the proxy runs for as long as the app does
+  (no options)     open the window; the proxy runs for as long as the app does,
+                   which with a tray is until \"Quit\" in the tray icon's menu
   --autostart      as started at login: honours the \"Start minimized\" setting
   --headless       run the proxy without a window
   --port <n>       listen on this port instead of the configured one
@@ -188,12 +190,15 @@ fn main() {
     let shared = Arc::new(Shared::new(settings));
 
     if !args.headless {
-        if !instance::claim(shared.clone()) {
+        if !instance::claim() {
             println!("RTX VSR is already running; its window has been brought up.");
             return;
         }
         autostart::refresh();
         browsers::refresh();
+        if args.screenshot.is_none() {
+            tray::start(shared.clone());
+        }
     }
 
     if let Some(libs) = engine::runtime::find() {

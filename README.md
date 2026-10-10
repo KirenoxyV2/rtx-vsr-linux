@@ -138,9 +138,12 @@ Then, in the window:
 | Show RTX VSR indicator | Draws an "RTX VSR" mark in the top right corner of a video while the frames on screen are upscaled ones. |
 | Start at login | Starts the app with your session. *Start minimized* (shown once this is on) keeps the window out of the way then. |
 
-The app upscales for as long as it runs; closing the window quits it, and
-video then simply plays as usual. Starting it a second time brings the window
-back.
+The app upscales for as long as it runs. Closing the window leaves it running
+in the tray: a click on the icon (or starting the app a second time) brings
+the window back, and the icon's menu switches upscaling on and off and has
+*Quit*. On a desktop without a tray, closing the window quits the app, and
+video then simply plays as usual. GNOME gets a tray from the "AppIndicator and
+KStatusNotifierItem Support" extension.
 
 **What "Connect" does.** A running browser cannot be told to load anything,
 so the app writes a launcher override: a copy of the browser's own `.desktop`

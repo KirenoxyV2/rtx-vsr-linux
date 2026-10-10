@@ -2,12 +2,16 @@
 //!
 //! The app is an iced daemon with at most one window, so that a second
 //! launch can bring up a fresh window (a minimised one cannot be raised on
-//! Wayland). Closing the window quits, which also stops the proxy.
+//! Wayland). Closing the window leaves the app in the tray; where the
+//! desktop has no tray it quits, which also stops the proxy.
 
 use std::fmt;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
+
+use iced::futures::channel::mpsc;
+use iced::futures::{Stream, StreamExt};
 
 use iced::overlay::menu;
 use iced::widget::{
@@ -54,9 +58,38 @@ pub struct Options {
     pub screenshot: Option<std::path::PathBuf>,
 }
 
+/// What the tray icon and later launches of the app ask of the window.
+#[derive(Debug, Clone, Copy)]
+pub enum Request {
+    Show,
+    Quit,
+}
+
+type Requests = (
+    mpsc::UnboundedSender<Request>,
+    Mutex<Option<mpsc::UnboundedReceiver<Request>>>,
+);
+static REQUESTS: LazyLock<Requests> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::unbounded();
+    (sender, Mutex::new(Some(receiver)))
+});
+
+/// Hands a request to the window's thread; callable from any other.
+pub fn request(request: Request) {
+    let _ = REQUESTS.0.unbounded_send(request);
+}
+
+fn requests() -> impl Stream<Item = Message> {
+    let receiver = REQUESTS.1.lock().unwrap().take();
+    iced::futures::stream::iter(receiver)
+        .flatten()
+        .map(Message::Request)
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
+    Request(Request),
     Opened(window::Id),
     Closed(window::Id),
     Enabled(bool),
@@ -214,6 +247,7 @@ impl App {
             iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
             window::open_events().map(Message::Opened),
             window::close_events().map(Message::Closed),
+            Subscription::run(requests),
         ])
     }
 
@@ -221,6 +255,7 @@ impl App {
         match message {
             Message::Tick => {
                 self.ticks += 1;
+                self.settings = self.shared.settings(); // the tray's menu changes them too
                 self.stats = self.shared.stats.lock().unwrap().clone();
                 self.runtime = self.shared.runtime.lock().unwrap().clone();
                 self.monitors = self.shared.monitors.lock().unwrap().clone();
@@ -243,17 +278,23 @@ impl App {
                 if let (Some(_), Some(id), 4) = (&self.screenshot, self.window, self.ticks) {
                     return window::screenshot(id).map(Message::Shot);
                 }
-                if self.shared.show_window.swap(false, Ordering::Relaxed) {
-                    // Launched again: a new window is the one thing every
-                    // desktop will put in front of the user.
-                    let old = self.window.take();
-                    let open = self.open_window();
-                    return match old {
-                        Some(old) => Task::batch([window::close(old), open]),
-                        None => open,
-                    };
+                if self.window.is_none() && !self.shared.tray.load(Ordering::Relaxed) {
+                    // The tray went away while the app was in it.
+                    return self.open_window();
                 }
             }
+            Message::Request(Request::Show) => {
+                // Asked for through the tray or by being launched again: a new
+                // window is the one thing every desktop will put in front
+                // of the user.
+                let old = self.window.take();
+                let open = self.open_window();
+                return match old {
+                    Some(old) => Task::batch([window::close(old), open]),
+                    None => open,
+                };
+            }
+            Message::Request(Request::Quit) => return iced::exit(),
             Message::Opened(id) => {
                 if Some(id) == self.window && std::mem::take(&mut self.minimize_when_open) {
                     return window::minimize(id, true);
@@ -261,7 +302,10 @@ impl App {
             }
             Message::Closed(id) => {
                 if Some(id) == self.window {
-                    return iced::exit();
+                    self.window = None;
+                    if !self.shared.tray.load(Ordering::Relaxed) {
+                        return iced::exit();
+                    }
                 }
             }
             Message::Enabled(on) => self.change(|s| s.enabled = on),

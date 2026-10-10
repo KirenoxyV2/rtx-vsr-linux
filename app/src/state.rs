@@ -140,8 +140,8 @@ pub struct Shared {
     pub monitors: Mutex<Vec<Monitor>>,
     pub stats: Mutex<Stats>,
     pub runtime: Mutex<Runtime>,
-    /// Another launch of the app asked for the window.
-    pub show_window: AtomicBool,
+    /// The desktop has a tray and the app's icon is in it.
+    pub tray: AtomicBool,
 }
 
 impl Shared {
@@ -151,7 +151,7 @@ impl Shared {
             monitors: Mutex::new(Vec::new()),
             stats: Mutex::new(Stats::default()),
             runtime: Mutex::new(Runtime::Missing),
-            show_window: AtomicBool::new(false),
+            tray: AtomicBool::new(false),
         }
     }
 

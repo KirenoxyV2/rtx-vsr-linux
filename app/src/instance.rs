@@ -1,13 +1,11 @@
 //! One window per user: a second launch asks the first to show its window
 //! and exits.
 
+use crate::state::APP_ID;
+use crate::ui::{self, Request};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-
-use crate::state::{Shared, APP_ID};
 
 fn socket_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
@@ -18,7 +16,7 @@ fn socket_path() -> PathBuf {
 
 /// Returns `false` if another instance is running (it has been told to show
 /// its window); otherwise starts listening for later launches.
-pub fn claim(shared: Arc<Shared>) -> bool {
+pub fn claim() -> bool {
     let path = socket_path();
     if let Ok(mut other) = UnixStream::connect(&path) {
         let _ = other.write_all(b"show");
@@ -35,7 +33,7 @@ pub fn claim(shared: Arc<Shared>) -> bool {
                 let mut word = [0u8; 4];
                 let mut stream = stream;
                 if stream.read_exact(&mut word).is_ok() && &word == b"show" {
-                    shared.show_window.store(true, Ordering::Relaxed);
+                    ui::request(Request::Show);
                 }
             }
         });

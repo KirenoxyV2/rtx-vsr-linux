@@ -568,8 +568,16 @@ controls and inside whatever goes fullscreen.
 minimized" minimises the window at login; a second launch opens a new window
 instead of trying to raise the old one, which Wayland does not allow.
 
+**The tray icon** is a StatusNotifierItem (the `ksni` crate, pure Rust over
+D-Bus, so no GTK or libappindicator to link). While the desktop has a
+StatusNotifierWatcher, closing the window only closes the window; without
+one the icon would be nowhere, so closing quits as before, and if the watcher
+disappears while the app sits in the tray the window is opened again. The
+icon's thread and later launches reach the window's thread through one
+channel that is an iced subscription (`ui::request`), not by being polled.
+
 Open: long sessions on YouTube in a normal window (quality switches, ads,
-live), a tray icon for desktops that have one, VP9 through NVDEC (Turing
+live), VP9 through NVDEC (Turing
 decodes it) so that steering to H.264 becomes optional.
 
 ## 10. References
