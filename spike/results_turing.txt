@@ -1,0 +1,34 @@
+# rtx-vsr-linux M1 spike results — RTX 2060 SUPER (Turing, sm_75) — 2026-10-10
+# host: WSL2 Ubuntu 26.04, Windows driver 610.88 (KMD) / CUDA UMD 13.3, nvidia-vfx 0.2.0.0 (pip wheel)
+
+# KEY FIX: on WSL2, NGX's dlopen("libcuda.so") (unversioned) fails because WSL
+# ships only /usr/lib/wsl/lib/libcuda.so.1 and the ldconfig cache has no
+# unversioned entry. Fix (one-time, root):
+#   ln -sf /usr/lib/wsl/lib/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so && ldconfig
+# Without it: NvVFX_Load fails (code -1) and the process double-frees/aborts.
+# With it: ALL modes load and run on Turing. The model lib bundles cubins for
+# sm_75 (41), sm_80 (69), sm_86 (10), sm_89 (10) — Turing IS supported upstream
+# of the "experimental" gate; the gate's thermal warning still applies.
+
+## GPU 0 (full suite)
+{'gpu': 0, 'mode': 1, 'in': '1280x720', 'out': '2560x1440', 'ms_per_frame': 4.09, 'fps_at_budget': 244.7, 'vram_used_during_run_mb': 198, 'vram_free_before_mb': 7150}
+{'gpu': 0, 'mode': 2, 'in': '1280x720', 'out': '2560x1440', 'ms_per_frame': 4.32, 'fps_at_budget': 231.4, 'vram_used_during_run_mb': 222, 'vram_free_before_mb': 7146}
+{'gpu': 0, 'mode': 3, 'in': '1280x720', 'out': '2560x1440', 'ms_per_frame': 8.94, 'fps_at_budget': 111.9, 'vram_used_during_run_mb': 336, 'vram_free_before_mb': 7146}
+{'gpu': 0, 'mode': 2, 'in': '1920x1080', 'out': '3840x2160', 'ms_per_frame': 9.68, 'fps_at_budget': 103.3, 'vram_used_during_run_mb': 434, 'vram_free_before_mb': 7146}
+{'gpu': 0, 'mode': 3, 'in': '1920x1080', 'out': '3840x2160', 'ms_per_frame': 20.35, 'fps_at_budget': 49.1, 'vram_used_during_run_mb': 700, 'vram_free_before_mb': 7146}
+{'gpu': 0, 'mode': 4, 'in': '1920x1080', 'out': '3840x2160', 'ms_per_frame': 31.49, 'fps_at_budget': 31.8, 'vram_used_during_run_mb': 874, 'vram_free_before_mb': 7146}
+
+## Probe suite (one effect per process, after the libcuda.so fix)
+# VSR/BICUBIC      ok (3,720,1280)
+# VSR/AI mode 1-4  ok (3,720,1280)
+# TrueHDR          ok
+# VSR/DENOISE_LOW  ok
+
+## Verdict
+# - Turing (RTX 2060 SUPER) runs every VFX VSR mode incl. AI upscale + TrueHDR.
+# - Real-time budgets on THIS card:
+#     720p->1440p  LOW/MEDIUM/HIGH: 245/231/112 fps  -> comfortably real-time at 60fps
+#     1080p->4K    MEDIUM: 103 fps  -> real-time at 60fps
+#     1080p->4K    HIGH: 49 fps     -> real-time up to ~48fps content; ULTRA: ~31fps (30fps content)
+# - VRAM cost: 0.2-0.9 GB per mode — fits an 8 GB card with desktop + browser loaded.
+# - 4090 reference is ~8-10x faster per frame; expected for Turing's 2nd-gen tensor cores.
