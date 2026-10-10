@@ -38,6 +38,7 @@ static EXTENSION: &[(&str, &[u8])] = extension_files![
     "icons/icon-32.png",
     "icons/icon-48.png",
     "icons/icon-128.png",
+    "icons/indicator.png",
 ];
 
 /// Launcher names (without `.desktop`) of browsers that accept
@@ -503,6 +504,15 @@ mod tests {
                 .values()
                 .map(|v| v.as_str().unwrap().to_owned()),
         );
+        for group in manifest["web_accessible_resources"].as_array().unwrap() {
+            referenced.extend(
+                group["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_owned()),
+            );
+        }
         for file in referenced {
             assert!(
                 EXTENSION.iter().any(|(n, _)| *n == file),

@@ -37,11 +37,12 @@
     const m = ev.data;
     if (ev.source !== window || !m) return;
     if (m.__vsr === "cfg") {
-      // The app's settings, for the on-video indicator.
+      // The app's settings and the picture, for the on-video indicator.
       try {
         chrome.runtime.sendMessage({ type: "appConfig" }, (res) => {
           void chrome.runtime.lastError;
-          window.postMessage({ __vsr: "cfgres", config: res || null }, "*");
+          window.postMessage({ __vsr: "cfgres", config: res || null,
+                               mark: chrome.runtime.getURL("icons/indicator.png") }, "*");
         });
       } catch (_) {}
       return;

@@ -15,7 +15,9 @@ touched). Checks that
   - segments arriving in arbitrary pieces work too,
   - VP9 is reported as unsupported (codec steering), audio is untouched,
   - the "RTX VSR" indicator sits in the video's top right corner when the
-    app's setting is on, and is absent when it is off.
+    app's setting is on (its picture loaded, although the page's content
+    security policy forbids images and inline styles), and is absent when
+    it is off.
 
 Usage:  ~/vsr-venv/bin/python spike/test_extension.py [path/to/rtx-vsr]
   needs: the Vivaldi Flatpak (com.vivaldi.Vivaldi), a built app
@@ -132,11 +134,13 @@ PAGE = r"""<!doctype html><meta charset=utf-8><title>vsr mse test</title>
     // The indicator is placed by a timer; give it a moment.
     const find = () => document.querySelector("[data-rtx-vsr-indicator]");
     const t1 = performance.now();
-    while (q.get("mark") === "1" && !(find() && find().style.display === "flex")
+    const shown = () => find() && find().style.display === "block" && find().complete;
+    while (q.get("mark") === "1" && !shown()
            && performance.now() - t1 < 4000) await new Promise((r) => setTimeout(r, 100));
     const m = find();
-    R.mark = m && m.style.display === "flex" ? {
-      text: m.textContent, left: m.offsetLeft, top: m.offsetTop, side: [m.offsetWidth, m.offsetHeight],
+    R.mark = m && m.style.display === "block" ? {
+      picture: m.naturalWidth, opacity: getComputedStyle(m).opacity, shadow: getComputedStyle(m).boxShadow,
+      left: m.offsetLeft, top: m.offsetTop, side: [m.offsetWidth, m.offsetHeight],
       video: [v.offsetLeft, v.offsetTop, v.clientWidth, v.clientHeight],
     } : null;
   } catch (e) {
@@ -233,7 +237,8 @@ def check(label, res, n, expect_vsr, expect_mark=False):
     mark = res.get("mark")
     if mark:
         vx, vy, vw, vh = mark["video"]
-        in_corner = (mark["text"] == "RTXVSR" and mark["side"][0] == mark["side"][1] > 20
+        in_corner = (mark["picture"] > 0 and mark["opacity"] == "0.7" and mark["shadow"] == "none"
+                     and mark["side"][0] == mark["side"][1] > 20
                      and vx + vw / 2 < mark["left"] and mark["left"] + mark["side"][0] <= vx + vw
                      and vy <= mark["top"] < vy + vh / 4)
     checks = {
@@ -309,6 +314,11 @@ async def main():
     class Quiet(http.server.SimpleHTTPRequestHandler):
         def log_message(self, *a):
             pass
+
+        def end_headers(self):
+            # As strict as sites get about what the indicator is made of.
+            self.send_header("Content-Security-Policy", "img-src 'none'; style-src 'none'")
+            super().end_headers()
 
     handler = functools.partial(Quiet, directory=site)
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", PAGE_PORT), handler)

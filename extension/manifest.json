@@ -17,6 +17,9 @@
     "service_worker": "background.js"
   },
   "options_page": "options.html",
+  "web_accessible_resources": [
+    { "resources": ["icons/indicator.png"], "matches": ["<all_urls>"] }
+  ],
   "action": {
     "default_title": "RTX VSR",
     "default_popup": "popup.html"

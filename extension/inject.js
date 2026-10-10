@@ -17,7 +17,7 @@
  * Everything else (audio, WebM, other codecs) passes straight through. To get
  * H.264 from sites that prefer VP9/AV1, those are reported as unsupported.
  *
- * If the app's "indicator" setting is on, an "RTX VSR" mark is drawn in the
+ * If the app's "indicator" setting is on, an "RTX VSR" mark is shown in the
  * top right corner of a video while the frames it shows are upscaled ones.
  */
 (() => {
@@ -52,12 +52,14 @@
 
   // ---- transport to the app (via the isolated-world content script) --------
   let nextId = 1;
+  let markUrl = null;              // the indicator's picture, told by content.js
   const waiting = new Map();
   window.addEventListener("message", (ev) => {
     const m = ev.data;
     if (ev.source !== window || !m) return;
     if (m.__vsr === "cfgres") {
       if (m.config) stats.indicator = !!(m.config.indicator && m.config.enabled);
+      if (typeof m.mark === "string") markUrl = m.mark;
       return;
     }
     if (m.__vsr !== "res") return;
@@ -352,31 +354,29 @@
 
   const marks = new WeakMap();     // <video> -> its indicator element
   function makeMark() {
-    // Built with DOM calls and style properties only: pages may forbid
-    // innerHTML (Trusted Types) and inline style attributes (CSP).
-    const el = document.createElement("div");
+    // Styled through style properties only (pages may forbid inline style
+    // attributes), and with everything a page's own rules for images could
+    // add to it switched off.
+    const el = document.createElement("img");
     el.setAttribute("data-rtx-vsr-indicator", "");
     el.setAttribute("aria-hidden", "true");
+    el.alt = "";
+    el.draggable = false;
+    el.src = markUrl;
     Object.assign(el.style, {
       position: "absolute", zIndex: "2147483000", display: "none", pointerEvents: "none",
-      boxSizing: "border-box", flexDirection: "column", alignItems: "center", justifyContent: "center",
-      background: "#76b900", color: "#fff", borderRadius: "14%", opacity: "0.92",
-      boxShadow: "0 1px 5px rgba(0,0,0,.55)", userSelect: "none", margin: "0", padding: "0",
-      fontFamily: "system-ui, 'Segoe UI', Roboto, Arial, sans-serif", fontWeight: "800",
-      letterSpacing: "0.02em", textAlign: "center", textShadow: "none", lineHeight: "1.08",
+      opacity: "0.7", userSelect: "none", margin: "0", padding: "0", border: "0",
+      borderRadius: "0", background: "none", boxShadow: "none", filter: "none",
+      maxWidth: "none", maxHeight: "none", minWidth: "0", minHeight: "0",
+      transform: "none", transition: "none",
     });
-    for (const word of ["RTX", "VSR"]) {
-      const line = document.createElement("div");
-      line.textContent = word;
-      el.appendChild(line);
-    }
     return el;
   }
 
   function placeMark(video) {
     let el = marks.get(video);
     const host = video.offsetParent;   // null while the element is not laid out
-    const show = stats.indicator && !!host && video.clientWidth > 0 && upscaled(video);
+    const show = stats.indicator && !!markUrl && !!host && video.clientWidth > 0 && upscaled(video);
     if (!show) {
       if (el) el.style.display = "none";
       return;
@@ -397,8 +397,8 @@
     const left = video.offsetLeft + video.clientLeft + (ew - w) / 2 + w - side - gap;
     const top = video.offsetTop + video.clientTop + (eh - h) / 2 + gap;
     Object.assign(el.style, {
-      display: "flex", left: Math.round(left) + "px", top: Math.round(top) + "px",
-      width: side + "px", height: side + "px", fontSize: Math.round(side * 0.34) + "px",
+      display: "block", left: Math.round(left) + "px", top: Math.round(top) + "px",
+      width: side + "px", height: side + "px",
     });
   }
 

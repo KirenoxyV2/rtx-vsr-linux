@@ -556,10 +556,12 @@ command line.
 **The indicator.** Whether a video is showing upscaled frames is read from
 the decoder, not assumed: the hook remembers the output sizes the app
 returned for a stream, and a `<video>` playing that MediaSource whose
-`videoWidth × videoHeight` is one of them is showing them. The mark is a DOM
-element (no `innerHTML`, no style attribute: Trusted Types and CSP) placed in
-the picture's top right corner inside the video's offset parent, which keeps
-it under the player's own controls and inside whatever goes fullscreen.
+`videoWidth × videoHeight` is one of them is showing them. The mark is an
+`<img>` of `extension/icons/indicator.png` at 70 % opacity (a web-accessible
+resource, which a page's `img-src` does not apply to; styled through style
+properties, never a style attribute) placed in the picture's top right corner
+inside the video's offset parent, which keeps it under the player's own
+controls and inside whatever goes fullscreen.
 
 **The window** is an iced daemon with one window, software-rendered
 (tiny-skia): a settings panel does not need a second GPU context. "Start
