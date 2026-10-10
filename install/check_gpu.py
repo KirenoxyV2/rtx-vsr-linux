@@ -7,12 +7,12 @@ nvidia-smi (no Python GPU deps required), so it can run before the venv is
 even built. The proxy / installer calls this and gates on the verdict.
 
 Verdicts:
-  supported     — RTX 30xx+ (Ampere, sm_8x) or newer. Blessed path.
-  experimental  — Turing (sm_75, e.g. RTX 2060). Works but thermally risky;
-                  user must opt in explicitly.
+  supported     — any RTX card: Turing (20xx, sm_75) or newer. The bundled
+                  model ships sm_75/80/86/89 kernels; every mode was measured
+                  on an RTX 2060 SUPER (spike/results_turing.txt).
   unsupported   — no NVIDIA GPU, pre-Turing, or driver too old.
 
-Exit codes: 0 = supported, 10 = experimental, 20 = unsupported.
+Exit codes: 0 = supported, 20 = unsupported.
 Prints a human-readable report to stdout and a machine-readable JSON line
 to stderr (so callers can parse it without scraping the prose).
 """
@@ -96,10 +96,8 @@ def main():
         sm = g["sm"]
         if sm is None:
             g["class"] = "unknown"
-        elif sm >= 80:          # Ampere (30xx) and newer — includes Ada 40xx (sm_89)
+        elif sm >= 75:          # Turing (20xx), Ampere (30xx), Ada (40xx), ...
             g["class"] = "supported"
-        elif sm >= 75:          # Turing (20xx)
-            g["class"] = "experimental"
         else:
             g["class"] = "unsupported"
 
@@ -107,15 +105,9 @@ def main():
         report("unsupported", "nvidia-smi present but no GPU enumerated")
         return
 
-    # Overall verdict: supported if ANY gpu is supported, else experimental
-    # if any experimental, else unsupported.
+    # Overall verdict: supported if ANY gpu is supported.
     classes = {g["class"] for g in gpus}
-    if "supported" in classes:
-        verdict = "supported"
-    elif "experimental" in classes:
-        verdict = "experimental"
-    else:
-        verdict = "unsupported"
+    verdict = "supported" if "supported" in classes else "unsupported"
 
     # Build the human report.
     lines = []
@@ -126,7 +118,6 @@ def main():
                  f"[{'OK' if drv_ok else 'TOO OLD'}]")
     for g in gpus:
         tag = {"supported": "SUPPORTED",
-               "experimental": "EXPERIMENTAL (thermal risk)",
                "unsupported": "UNSUPPORTED",
                "unknown": "UNKNOWN"}[g["class"]]
         vram = f"{g['vram_mb']} MB" if g.get("vram_mb") else "?"
@@ -134,15 +125,13 @@ def main():
                      f"{vram} VRAM  -> {tag}")
     lines.append("-" * 40)
     if verdict == "supported":
-        lines.append("VERDICT: supported — RTX 30xx+ (Ampere+) detected. "
-                     "Blessed path; target is RTX 4090.")
-    elif verdict == "experimental":
-        lines.append("VERDICT: experimental — only Turing (sm_75, e.g. RTX 2060) "
-                     "found. VSR *can* run but these cards are thermally "
-                     "constrained and will get hot under sustained load. "
-                     "You must pass --i-know-what-im-doing to proceed.")
+        lines.append("VERDICT: supported — RTX GPU detected.")
+        if all(g["sm"] < 80 for g in gpus if g["class"] == "supported"):
+            lines.append("NOTE: Turing (RTX 20xx) runs every mode, at roughly a "
+                         "tenth of a 4090's speed: prefer LOW/MEDIUM for 60 fps "
+                         "or 4K output (HIGH/ULTRA hold ~30 fps at 1080p input).")
     else:
-        lines.append("VERDICT: unsupported — no Ampere+ GPU or driver too old.")
+        lines.append("VERDICT: unsupported — no RTX (Turing or newer) GPU found.")
     if not drv_ok:
         lines.append("NOTE: driver is below the minimum VFX branch; update it "
                      "(570.190 / 580.82 / 590.44+) before installing.")
@@ -156,7 +145,7 @@ def main():
         "gpus": gpus,
     }), file=sys.stderr)
 
-    return {"supported": 0, "experimental": 10, "unsupported": 20}[verdict]
+    return {"supported": 0, "unsupported": 20}[verdict]
 
 
 def report(verdict, reason):
@@ -164,7 +153,7 @@ def report(verdict, reason):
     print("-" * 40)
     print(f"VERDICT: {verdict}")
     print(json.dumps({"verdict": verdict, "reason": reason}), file=sys.stderr)
-    sys.exit({"supported": 0, "experimental": 10, "unsupported": 20}[verdict])
+    sys.exit({"supported": 0, "unsupported": 20}[verdict])
 
 
 if __name__ == "__main__":
