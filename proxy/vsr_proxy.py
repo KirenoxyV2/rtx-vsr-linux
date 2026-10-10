@@ -19,10 +19,10 @@ baseline; NVDEC+NVENC is the later measured upgrade. We already know from M1.5
 the AI stage alone is 0.6 ms/frame, so even with CPU I/O this stays real-time
 for typical clips on a 4090.
 
-Run:
-    source spike/env.sh
-    .venv/bin/python proxy/vsr_proxy.py [--port 8730] [--gpu 0]
-Then open http://127.0.0.1:8730/ in Brave/Firefox.
+Run (any venv with requirements.txt installed):
+    ~/vsr-venv/bin/python proxy/vsr_proxy.py [--port 8730] [--gpu 0] [--max-out 1440]
+Then open http://127.0.0.1:8730/ for the demo page, or load extension/ in a
+Chromium browser: it sends `POST /transform?mse=1` (see vsr_segment.py).
 
 Env:
     VSR_GPU      default GPU index (default 0)
@@ -413,11 +413,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers",
+                         "X-VSR-Meta, X-VSR-Init-Length, X-VSR-Elapsed-S")
         if extra:
             for k, v in extra.items():
                 self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self._send(204, b"", extra={
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400"})
 
     def do_GET(self):
         import json
@@ -549,20 +557,26 @@ class Handler(BaseHTTPRequestHandler):
             mse = q.get("mse", ["0"])[0] in ("1", "true")
             t0 = time.perf_counter()
             if mse:
+                # Body = the stream's init segment followed by one media
+                # segment. 200 = fMP4 whose first X-VSR-Init-Length bytes are
+                # the new init segment; 204 = leave the original as it is.
                 if not GPU["ready"]:
                     self._send(503, "GPU not ready: %s" % GPU.get("err"))
                     return
                 import vsr_segment
-                data, meta = vsr_segment.transform_segment(
-                    raw, mode=mode, scale=scale,
-                    max_h=POLICY["max_out_h"], gpu=GPU["gpu_index"],
-                    strict=strict)
+                max_h = min(POLICY["max_out_h"],
+                            int(q.get("maxh", [POLICY["max_out_h"]])[0]))
+                with GPU_LOCK:
+                    data, meta = vsr_segment.transform_segment(
+                        raw, mode=mode, scale=scale, max_h=max_h,
+                        gpu=GPU["gpu_index"], strict=strict)
                 if data is None:
-                    self._send(200, raw, "application/octet-stream", extra={
-                        "X-VSR-Meta": json.dumps(meta or {})})
+                    self._send(204, b"", extra={"X-VSR-Meta": json.dumps(meta or {})})
                     return
+                _record_activity(meta)
                 self._send(200, data, "video/mp4", extra={
                     "X-VSR-Meta": json.dumps(meta),
+                    "X-VSR-Init-Length": str(meta["init_len"]),
                     "X-VSR-Elapsed-S": f"{time.perf_counter()-t0:.2f}",
                 })
                 return
