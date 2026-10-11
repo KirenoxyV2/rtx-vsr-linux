@@ -4,6 +4,17 @@
 //!        200  upscaled fMP4; the first X-VSR-Init-Length bytes are its init
 //!             segment, X-VSR-Meta describes what was done
 //!        204  leave the original alone (X-VSR-Meta says why)
+//!        What the player is doing, all optional: &rate= its speed if not
+//!        1; &behind= the seconds of the fragment that the playhead is
+//!        past, which are hurried through; &lead= the seconds it has
+//!        buffered in front of the playhead, which had better not run out.
+//!        With &parts=1 the answer comes as soon as the first frames are
+//!        done and holds only those; X-VSR-Next then names the fragment for
+//!   POST /transform/next?job=&behind=&lead=   the next part of it (more
+//!        `moof`+`mdat`), again with X-VSR-Next unless it is the last.
+//!        Anything but 200 means the fragment failed: fall back to the
+//!        original.
+//!   POST /transform/cancel?job=  the rest is not wanted (the player seeked)
 //!   GET  /config   what the extension needs to know about the app's settings;
 //!        with ?playing=1&sw=&sh=&dpr= the page also reports that upscaled
 //!        video is playing on that screen
@@ -13,8 +24,11 @@
 //! Only this machine can connect, and of the pages running on it only
 //! browser extensions may: a web site must not be able to drive the GPU.
 
+use std::collections::HashMap;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -22,11 +36,13 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::display::{self, Screen};
 use crate::engine::pipeline::MODE_NAMES;
-use crate::engine::{Engine, Outcome};
+use crate::engine::{Engine, Handle, Position, Reply as Progress, Summary};
 use crate::gpu::nvml;
 use crate::state::Shared;
 
-const THREADS: usize = 4;
+/// A caller that takes a fragment in parts holds one of these for a moment
+/// per part, next to the requests for settings and status.
+const THREADS: usize = 8;
 /// Largest request body accepted; a fragment is a few MB.
 const MAX_BODY: usize = 256 << 20;
 /// "Active" in /status for this long after a fragment was upscaled.
@@ -34,6 +50,95 @@ const ACTIVE_FOR: Duration = Duration::from_secs(5);
 /// Upscaled video counts as playing for this long after a page said so
 /// (pages repeat it every second).
 pub const WATCHING_FOR: Duration = Duration::from_secs(5);
+/// How long the next part of a fragment may take (another video's fragment
+/// can be in front of it), and how long a fragment is kept for a caller that
+/// has stopped asking for its parts.
+const PART_TIMEOUT: Duration = Duration::from_secs(25);
+const ABANDONED_AFTER: Duration = Duration::from_secs(60);
+
+/// A fragment that is handed out part by part.
+struct Parked {
+    replies: Mutex<mpsc::Receiver<Progress>>,
+    handle: Handle,
+    src: (u32, u32),
+    out: (u32, u32),
+    /// VSR mode it started in, and the one that was asked for.
+    mode: u8,
+    requested: u8,
+    indicator: bool,
+    init_len: usize,
+    touched: Mutex<Instant>,
+}
+
+impl Parked {
+    /// The next part, and how it all went if that was the last one.
+    fn next(&self) -> Result<(Vec<u8>, Option<Summary>), String> {
+        *self.touched.lock().unwrap() = Instant::now();
+        let replies = self.replies.lock().unwrap();
+        let recv = || match replies.recv_timeout(PART_TIMEOUT) {
+            Ok(Progress::Failed(e)) => Err(e),
+            Ok(progress) => Ok(progress),
+            Err(RecvTimeoutError::Timeout) => Err("the GPU is not getting to this fragment".into()),
+            // The GPU thread says nothing more about a fragment it was told to drop.
+            Err(RecvTimeoutError::Disconnected) => Err("cancelled".to_string()),
+        };
+        match recv()? {
+            Progress::Part { media, last: false } => Ok((media, None)),
+            Progress::Part { media, last: true } => match recv()? {
+                Progress::Done(summary) => Ok((media, Some(summary))),
+                _ => Err("the GPU thread lost track of a fragment".into()),
+            },
+            _ => Err("the GPU thread lost track of a fragment".into()),
+        }
+    }
+
+    /// X-VSR-Meta: what is being done, with the totals once they are known.
+    fn meta(&self, done: Option<&Summary>) -> serde_json::Value {
+        let mode = done.map_or(self.mode, |summary| summary.mode);
+        let mut meta = json!({
+            "in": format!("{}x{}", self.src.0, self.src.1),
+            "out": format!("{}x{}", self.out.0, self.out.1),
+            "mode": mode,
+            "mode_name": MODE_NAMES[mode as usize],
+            "mode_requested": self.requested,
+            "downshifted": mode < self.requested,
+            "init_len": self.init_len,
+            "indicator": self.indicator,
+        });
+        if let Some(summary) = done {
+            meta["frames"] = json!(summary.frames);
+            meta["ms"] = json!((summary.work_seconds * 1000.0).round());
+        }
+        meta
+    }
+}
+
+/// The fragments callers are in the middle of fetching, by the name
+/// X-VSR-Next gave them.
+#[derive(Default)]
+pub struct Jobs {
+    last_id: AtomicU64,
+    parked: Mutex<HashMap<u64, Arc<Parked>>>,
+}
+
+impl Jobs {
+    fn park(&self, job: Parked) -> u64 {
+        let id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut parked = self.parked.lock().unwrap();
+        // Dropping a fragment tells the GPU thread to stop working on it.
+        parked.retain(|_, job| job.touched.lock().unwrap().elapsed() < ABANDONED_AFTER);
+        parked.insert(id, Arc::new(job));
+        id
+    }
+
+    fn get(&self, id: u64) -> Option<Arc<Parked>> {
+        self.parked.lock().unwrap().get(&id).cloned()
+    }
+
+    fn remove(&self, id: u64) -> Option<Arc<Parked>> {
+        self.parked.lock().unwrap().remove(&id)
+    }
+}
 
 pub fn start(shared: Arc<Shared>, engine: Arc<Engine>, port: u16) -> Result<(), String> {
     let server = Server::http(("127.0.0.1", port)).map_err(|e| {
@@ -50,13 +155,15 @@ pub fn start(shared: Arc<Shared>, engine: Arc<Engine>, port: u16) -> Result<(), 
         }
     })?;
     let server = Arc::new(server);
+    let jobs = Arc::new(Jobs::default());
     for i in 0..THREADS {
         let (server, shared, engine) = (server.clone(), shared.clone(), engine.clone());
+        let jobs = jobs.clone();
         std::thread::Builder::new()
             .name(format!("http-{i}"))
             .spawn(move || {
                 while let Ok(request) = server.recv() {
-                    handle(request, &shared, &engine, port);
+                    handle(request, &shared, &engine, &jobs, port);
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -72,16 +179,16 @@ fn header(request: &Request, name: &'static str) -> Option<String> {
         .map(|h| h.value.as_str().to_owned())
 }
 
-fn query(url: &str, name: &str) -> Option<f64> {
+fn param<'a>(url: &'a str, name: &str) -> Option<&'a str> {
     let (_, query) = url.split_once('?')?;
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
-        if key == name {
-            value.parse().ok()
-        } else {
-            None
-        }
+        (key == name).then_some(value)
     })
+}
+
+fn query(url: &str, name: &str) -> Option<f64> {
+    param(url, name)?.parse().ok()
 }
 
 /// The screen of the page a request is made for, if it says.
@@ -122,7 +229,7 @@ impl Reply {
     }
 }
 
-fn handle(mut request: Request, shared: &Shared, engine: &Engine, port: u16) {
+fn handle(mut request: Request, shared: &Shared, engine: &Engine, jobs: &Jobs, port: u16) {
     let origin = header(&request, "Origin");
     let from_extension = origin
         .as_deref()
@@ -152,7 +259,9 @@ fn handle(mut request: Request, shared: &Shared, engine: &Engine, port: u16) {
             (Method::Get, "/health") => health(shared),
             (Method::Get, "/config") => config(&url, shared),
             (Method::Get, "/status") => status(shared),
-            (Method::Post, "/transform") => transform(&mut request, &url, shared, engine),
+            (Method::Post, "/transform") => transform(&mut request, &url, shared, engine, jobs),
+            (Method::Post, "/transform/next") => next_part(&url, jobs),
+            (Method::Post, "/transform/cancel") => cancel(&url, jobs),
             _ => Reply::text(404, "not found"),
         }
     };
@@ -171,7 +280,7 @@ fn handle(mut request: Request, shared: &Shared, engine: &Engine, port: u16) {
         add("Access-Control-Allow-Headers", "Content-Type");
         add(
             "Access-Control-Expose-Headers",
-            "X-VSR-Meta, X-VSR-Init-Length",
+            "X-VSR-Meta, X-VSR-Init-Length, X-VSR-Next",
         );
         add("Access-Control-Allow-Private-Network", "true");
         add("Access-Control-Max-Age", "86400");
@@ -248,7 +357,35 @@ fn status(shared: &Shared) -> Reply {
     }))
 }
 
-fn transform(request: &mut Request, url: &str, shared: &Shared, engine: &Engine) -> Reply {
+/// An answer that carries video: `job` names the fragment if more is to come.
+fn media(body: Vec<u8>, meta: serde_json::Value, init_len: usize, job: Option<u64>) -> Reply {
+    let mut headers = vec![("X-VSR-Meta", meta.to_string())];
+    if init_len > 0 {
+        headers.push(("X-VSR-Init-Length", init_len.to_string()));
+    }
+    if let Some(id) = job {
+        headers.push(("X-VSR-Next", id.to_string()));
+    }
+    Reply {
+        status: 200,
+        body,
+        content_type: "video/mp4",
+        headers,
+    }
+}
+
+fn failed(e: &str) -> Reply {
+    eprintln!("rtx-vsr: transform failed: {e}");
+    Reply::text(500, e)
+}
+
+fn transform(
+    request: &mut Request,
+    url: &str,
+    shared: &Shared,
+    engine: &Engine,
+    jobs: &Jobs,
+) -> Reply {
     let settings = shared.settings();
     let skip = |why: &str, src: Option<(u32, u32)>| {
         Reply {
@@ -284,34 +421,83 @@ fn transform(request: &mut Request, url: &str, shared: &Shared, engine: &Engine)
         screen(url),
     );
 
-    match engine.transform(data, settings.quality, target) {
-        Ok(Outcome::Passthrough { why, src }) => skip(&why, src),
-        Ok(Outcome::Done(out)) => {
-            let meta = json!({
-                "in": format!("{}x{}", out.src.0, out.src.1),
-                "out": format!("{}x{}", out.out.0, out.out.1),
-                "mode": out.mode,
-                "mode_name": MODE_NAMES[out.mode as usize],
-                "mode_requested": settings.quality,
-                "downshifted": out.mode < settings.quality,
-                "frames": out.frames,
-                "ms": (out.work_seconds * 1000.0).round(),
-                "init_len": out.init_len,
-                "indicator": settings.indicator,
-            });
-            Reply {
-                status: 200,
-                body: out.bytes,
-                content_type: "video/mp4",
-                headers: vec![
-                    ("X-VSR-Meta", meta.to_string()),
-                    ("X-VSR-Init-Length", out.init_len.to_string()),
-                ],
+    let rate = query(url, "rate").filter(|r| r.is_finite()).unwrap_or(1.0);
+    let ticket = engine.submit(data, settings.quality, target, rate, position(url));
+    let start = match ticket.replies.recv() {
+        Ok(Progress::Start(start)) => start,
+        Ok(Progress::Passthrough { why, src }) => return skip(&why, src),
+        Ok(Progress::Failed(e)) => return failed(&e),
+        Ok(_) | Err(_) => return failed("the GPU thread has stopped"),
+    };
+    let job = Parked {
+        replies: Mutex::new(ticket.replies),
+        handle: ticket.handle,
+        src: start.src,
+        out: start.out,
+        mode: start.mode,
+        requested: settings.quality,
+        indicator: settings.indicator,
+        init_len: start.init.len(),
+        touched: Mutex::new(Instant::now()),
+    };
+    let mut body = start.init;
+    let in_parts = param(url, "parts") == Some("1");
+    loop {
+        match job.next() {
+            Ok((part, done)) => {
+                body.extend_from_slice(&part);
+                if done.is_some() {
+                    return media(body, job.meta(done.as_ref()), job.init_len, None);
+                }
+                if in_parts {
+                    let (meta, init_len) = (job.meta(None), job.init_len);
+                    return media(body, meta, init_len, Some(jobs.park(job)));
+                }
             }
-        }
-        Err(e) => {
-            eprintln!("rtx-vsr: transform failed: {e}");
-            Reply::text(500, &e)
+            Err(e) => return failed(&e),
         }
     }
+}
+
+fn job_id(url: &str) -> Option<u64> {
+    param(url, "job")?.parse().ok()
+}
+
+/// Where the player says it is with a fragment's video: `behind` and `lead`.
+fn position(url: &str) -> Position {
+    let seconds = |name| query(url, name).filter(|s| s.is_finite() && *s >= 0.0);
+    Position {
+        behind: seconds("behind").unwrap_or(0.0),
+        lead: seconds("lead").unwrap_or(f64::INFINITY),
+    }
+}
+
+fn next_part(url: &str, jobs: &Jobs) -> Reply {
+    let Some((id, job)) = job_id(url).and_then(|id| Some((id, jobs.get(id)?))) else {
+        return Reply::text(410, "no such fragment (any more)");
+    };
+    // The player has moved on since the part before.
+    job.handle.set_position(position(url));
+    match job.next() {
+        Ok((part, None)) => media(part, job.meta(None), 0, Some(id)),
+        Ok((part, done)) => {
+            jobs.remove(id);
+            media(part, job.meta(done.as_ref()), 0, None)
+        }
+        Err(e) => {
+            // Not news if the caller itself called it off.
+            if jobs.remove(id).is_none() {
+                return Reply::text(410, "cancelled");
+            }
+            failed(&e)
+        }
+    }
+}
+
+fn cancel(url: &str, jobs: &Jobs) -> Reply {
+    if let Some(job) = job_id(url).and_then(|id| jobs.remove(id)) {
+        // A request for its next part may be holding on to it.
+        job.handle.cancel();
+    }
+    Reply::text(204, "")
 }

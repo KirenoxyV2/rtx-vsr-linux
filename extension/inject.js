@@ -7,12 +7,16 @@
  *   - collects the appended bytes into complete top-level boxes,
  *   - keeps the stream's init segment (ftyp+moov),
  *   - sends init + each complete fragment (moof+mdat) to the RTX VSR app via
- *     content.js -> background.js, and appends the upscaled H.264 fragment the
- *     app returns (preceded by the app's own init segment when it changes),
+ *     content.js -> background.js, and appends the upscaled H.264 the app
+ *     returns (preceded by the app's own init segment when it changes). The
+ *     app hands a fragment back in parts, the first after a fraction of a
+ *     second; each is appended as it comes, so the video can play on while
+ *     the rest of the fragment is still being upscaled,
  *   - on any failure appends the original bytes, so playback never breaks.
  *
- * The page keeps seeing a normal SourceBuffer: `updating` is true and
- * `updateend` fires as usual while a fragment is away being transformed.
+ * The page keeps seeing a normal SourceBuffer: `updating` is true while a
+ * fragment is away being transformed, and its one `updateend` fires when
+ * all of it is in the buffer.
  *
  * Everything else (audio, WebM, other codecs) passes straight through. To get
  * H.264 from sites that prefer VP9/AV1, those are reported as unsupported.
@@ -71,11 +75,12 @@
     if (!w) return;
     waiting.delete(m.id);
     clearTimeout(w.timer);
-    w.resolve(m.ok ? { init: new Uint8Array(m.init), media: new Uint8Array(m.media), meta: m.meta }
+    w.resolve(m.ok ? { init: new Uint8Array(m.init), media: new Uint8Array(m.media), meta: m.meta,
+                       next: m.next || null }
                    : { failed: !m.passthrough, meta: m.meta });
   });
 
-  function transform(bytes) {
+  function ask(what, transfer) {
     return new Promise((resolve) => {
       const id = nextId++;
       const timer = setTimeout(() => {
@@ -83,9 +88,20 @@
         resolve({ failed: true });
       }, TIMEOUT_MS);
       waiting.set(id, { resolve, timer });
-      window.postMessage({ __vsr: "req", id, screen: screenInfo(), body: bytes.buffer }, "*", [bytes.buffer]);
+      window.postMessage(Object.assign({ __vsr: "req", id }, what), "*", transfer || []);
     });
   }
+  /* The app's answer for init + fragment: { init, media, meta, next }, where
+   * `media` is the first part of the upscaled fragment and `next`, if set,
+   * names the fragment for `nextPart`, which returns the same without
+   * `init`. Or { failed }, with `failed` false if the original is to stay.
+   * `playing` is what the player is doing with the fragment (see
+   * `playback`). */
+  const transform = (bytes, playing) =>
+    ask(Object.assign({ screen: screenInfo(), parts: true, body: bytes.buffer }, playing), [bytes.buffer]);
+  const nextPart = (job, playing) => ask({ next: job, behind: playing.behind, lead: playing.lead });
+  /* The rest is not wanted: the app can stop working on it. */
+  const cancel = (job) => window.postMessage({ __vsr: "req", id: 0, next: job, cancel: true }, "*");
 
   // The screen this window is on, in CSS pixels: the app caps the output to
   // that display's resolution.
@@ -222,7 +238,13 @@
       // upscaled video appended here, and the stretches of the timeline it
       // was appended for.
       st = { busy: false, gen: 0, sizes: new Set(), spans: [] };
+      st.native = null;      // the real append in progress (see `pump`)
+      st.hideStart = 0;      // real appends whose `updatestart` is still to come
+      st.job = null;         // the app's name for the fragment being fetched
       states.set(sb, st);
+      for (const name of ["updatestart", "update", "updateend", "error", "abort"]) {
+        sb.addEventListener(name, onNative, true);
+      }
     }
     st.intercept = wanted(type);
     if (!st.intercept) forget(st);
@@ -273,6 +295,37 @@
     } catch (_) { return null; }
   }
 
+  /* What the video this buffer belongs to is doing with a fragment that
+   * plays at `span`, for the app to plan on:
+   *   rate    its speed,
+   *   lead    the seconds it has buffered in front of the playhead (not
+   *           said while it is paused: then there is no hurry),
+   *   behind  the seconds of the fragment that nobody is waiting to see:
+   *           what lies behind the playhead (after a seek into the middle
+   *           of the fragment), and all of it while the video waits for
+   *           data from somewhere else. The sooner this fragment is out of
+   *           the way, the sooner that can come. */
+  function playback(st, span) {
+    for (const video of document.querySelectorAll("video")) {
+      const ref = sources.get(video.currentSrc || video.src), ms = ref && ref.deref();
+      if (!ms || !(streams.get(ms) || []).includes(st)) continue;
+      const t = video.currentTime, b = video.buffered;
+      const playing = { rate: video.playbackRate || 1, behind: 0 };
+      if (!video.paused) {
+        playing.lead = 0;
+        for (let i = 0; i < b.length; i++) {
+          if (b.start(i) <= t + 0.05 && t < b.end(i)) playing.lead = b.end(i) - t;
+        }
+      }
+      if (span) {
+        const length = span[1] - span[0], elsewhere = video.seeking && (t < span[0] || t >= span[1]);
+        playing.behind = elsewhere ? length : Math.max(0, Math.min(length, t - span[0]));
+      }
+      return playing;
+    }
+    return { rate: 1, behind: 0 };
+  }
+
   /* Takes note of fragments that have been appended: { span, out, src }, with
    * `out` the size of an upscaled one and `src` that of an original. */
   function remember(st, notes) {
@@ -302,11 +355,18 @@
     }
   }
 
-  /* Turn newly appended bytes into the bytes to really append (maybe none
-   * yet), with notes on the fragments among them (see `remember`). */
-  async function process(sb, st, bytes) {
+  /* Turn newly appended bytes into pieces for the real buffer (maybe none
+   * yet), with notes on the fragments among them (see `remember`), and hand
+   * them to `feed` as they come. */
+  async function process(sb, st, bytes, feed) {
     const buf = st.acc.length ? concat([st.acc, bytes]) : bytes;
-    const out = [], notes = [];
+    const stale = () => st.gen !== feed.gen;     // aborted meanwhile
+    let out = [], notes = [];
+    const flush = () => {
+      if (out.length) push(feed, concat(out), notes);
+      out = [];
+      notes = [];
+    };
     let pos = 0;
     for (;;) {
       const box = boxAt(buf, pos);
@@ -337,7 +397,12 @@
         const span = playsAt(sb, st);
         st.moof = null;
         st.head = [];
-        const res = stats.off ? { failed: false } : await transform(concat([st.init, fragment]));
+        let res = stats.off ? { failed: false }
+          : await transform(concat([st.init, fragment]), playback(st, span));
+        if (stale()) {
+          if (res.next) cancel(res.next);
+          return;
+        }
         if (res.media) {
           if (!sameBytes(st.ours, res.init)) {
             out.push(res.init);
@@ -345,12 +410,26 @@
           }
           out.push(res.media);
           stats.transformed++;
-          stats.failures = 0;
           stats.last = res.meta;
           // Frames of this size, at these times, are upscaled ones.
           notes.push({ span, out: res.meta && res.meta.out });
           if (res.meta && "indicator" in res.meta) stats.indicator = !!res.meta.indicator;
           watchVideos();
+          // The rest of the fragment, part by part; what is there already
+          // goes into the buffer meanwhile.
+          while (res.next) {
+            st.job = res.next;
+            flush();
+            res = await nextPart(res.next, playback(st, span));
+            if (stale()) return;             // abort() has told the app
+            st.job = null;
+            if (!res.media) break;
+            out.push(res.media);
+            if (res.meta && res.meta.frames) stats.last = res.meta;
+          }
+        }
+        if (res.media) {
+          stats.failures = 0;
         } else {
           if (res.failed && ++stats.failures >= MAX_FAILURES) {
             stats.off = true;
@@ -360,6 +439,8 @@
             out.push(st.init);
             st.ours = null;
           }
+          // Also if the app gave up in the middle of the fragment: the
+          // original then replaces the parts that are in the buffer.
           out.push(original);
           notes.push({ span, src: res.meta && res.meta.in });
           stats.passthrough++;
@@ -371,7 +452,7 @@
       }
     }
     st.acc = buf.slice(pos);
-    return { bytes: concat(out), notes };
+    flush();
   }
 
   // ---- the SourceBuffer facade ------------------------------------------------
@@ -388,30 +469,82 @@
 
   const origAppend = SB.prototype.appendBuffer;
 
-  /* The real append of what `process` produced. Upscaled video is several
-   * times the bytes the player budgeted for, so the buffer can be full where
-   * the original would have fitted: then the page keeps seeing `updating`
-   * and the append is retried as playback frees space, which is the pace the
-   * player would have settled on by itself. */
-  function finishAppend(sb, st, gen, out, notes) {
-    if (st.gen !== gen) return;          // aborted meanwhile
-    // The real append fires its own updatestart; the page already had ours.
-    const swallow = (ev) => ev.stopImmediatePropagation();
-    sb.addEventListener("updatestart", swallow, { capture: true, once: true });
-    try {
-      origAppend.call(sb, out);
+  /* One appendBuffer call of the page becomes a feed: the pieces `process`
+   * makes of it, which go into the real buffer one after the other, as they
+   * come, behind the page's back. The page had its `updatestart` when it
+   * called and gets `update` and `updateend` when the last piece is in. */
+  function push(feed, bytes, notes) {
+    feed.queue.push({ bytes, notes });
+    pump(feed);
+  }
+
+  function pump(feed) {
+    const { sb, st } = feed;
+    if (st.gen !== feed.gen || st.native || feed.retry) return;
+    const piece = feed.queue[0];
+    if (!piece) {
+      if (!feed.closed) return;
       st.busy = false;
-      remember(st, notes);
+      return fire(sb, ["update", "updateend"]);
+    }
+    try {
+      st.hideStart++;
+      origAppend.call(sb, piece.bytes);
     } catch (e) {
-      sb.removeEventListener("updatestart", swallow, { capture: true });
+      st.hideStart--;
+      // Upscaled video is several times the bytes the player budgeted for,
+      // so the buffer can be full where the original would have fitted:
+      // then the page keeps seeing `updating` and the append is retried as
+      // playback frees space, which is the pace the player would have
+      // settled on by itself.
       if (e && e.name === "QuotaExceededError") {
-        setTimeout(() => finishAppend(sb, st, gen, out, notes), 1000);
+        feed.retry = setTimeout(() => { feed.retry = 0; pump(feed); }, 1000);
         return;
       }
-      st.busy = false;
+      giveUp(st);
       console.warn("[vsr] append failed:", e);
-      fire(sb, ["error", "updateend"]);
+      return fire(sb, ["error", "updateend"]);
     }
+    feed.queue.shift();
+    st.native = { feed, broken: false };
+    remember(st, piece.notes);
+  }
+
+  /* The real buffer's own events (ours are not `isTrusted`). Those of a
+   * feed's appends are kept from the page, unless one goes wrong: then the
+   * page's append ends the way the real one did. */
+  function onNative(ev) {
+    const st = states.get(this);
+    if (!ev.isTrusted || !st) return;
+    if (ev.type === "updatestart") {
+      if (st.hideStart > 0) {
+        st.hideStart--;
+        ev.stopImmediatePropagation();
+      }
+      return;
+    }
+    const n = st.native;
+    if (!n) return;
+    if (ev.type === "error" || ev.type === "abort") {
+      n.broken = true;
+    } else if (ev.type === "update") {
+      ev.stopImmediatePropagation();
+    } else {                     // updateend
+      st.native = null;
+      if (n.broken) return giveUp(st);
+      ev.stopImmediatePropagation();
+      pump(n.feed);
+    }
+  }
+
+  /* The page's append is over before all of it is in the buffer: nothing
+   * more of its feed, and the app need not finish the fragment. */
+  function giveUp(st) {
+    st.gen++;
+    st.busy = false;
+    st.native = null;
+    if (st.job) cancel(st.job);
+    st.job = null;
   }
 
   SB.prototype.appendBuffer = function (data) {
@@ -419,21 +552,17 @@
     if (!st || !st.intercept) return origAppend.call(sb, data);
     if (sb.updating) throw invalidState("appendBuffer");
     const bytes = toBytes(data);
-    const gen = st.gen;
+    const feed = { sb, st, gen: st.gen, queue: [], closed: false, retry: 0 };
     st.busy = true;
-    queueMicrotask(() => { if (st.gen === gen) fire(sb, ["updatestart"]); });
-    process(sb, st, bytes).catch((e) => {
+    queueMicrotask(() => { if (st.gen === feed.gen) fire(sb, ["updatestart"]); });
+    process(sb, st, bytes, feed).catch((e) => {
       console.warn("[vsr] passing through after error:", e);
       st.intercept = false;
       forget(st);
-      return { bytes, notes: [] };
-    }).then((out) => {
-      if (st.gen !== gen) return;        // aborted meanwhile
-      if (!out.bytes.length) {
-        st.busy = false;
-        return fire(sb, ["update", "updateend"]);
-      }
-      finishAppend(sb, st, gen, out.bytes, out.notes);
+      push(feed, bytes, []);
+    }).then(() => {
+      feed.closed = true;
+      pump(feed);
     });
   };
 
@@ -441,13 +570,24 @@
   SB.prototype.abort = function () {
     const st = states.get(this);
     const wasBusy = isBusy(this);
+    // A real append in progress ends with `abort` and `updateend` of its own.
+    const real = nativeUpdating.get.call(this);
     if (st) {
-      st.gen++;
-      st.busy = false;
+      giveUp(st);
       resetParser(st);
     }
     origAbort.call(this);
-    if (wasBusy) fire(this, ["abort", "updateend"]);
+    if (wasBusy && !real) fire(this, ["abort", "updateend"]);
+  };
+
+  // A page that ends the stream while a fragment is away would be told it
+  // can, the real buffer being idle just then.
+  const origEnd = MS.prototype.endOfStream;
+  MS.prototype.endOfStream = function () {
+    if ((streams.get(this) || []).some((st) => st.busy)) {
+      throw new DOMException("Failed to execute 'endOfStream' on 'MediaSource': The 'updating' attribute is true on one or more of this MediaSource's SourceBuffers.", "InvalidStateError");
+    }
+    return origEnd.apply(this, arguments);
   };
 
   const origRemove = SB.prototype.remove;

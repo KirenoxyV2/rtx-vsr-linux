@@ -1,6 +1,7 @@
 //! The GPU worker: one thread that owns the CUDA context and everything
 //! built on it, fed through a channel. Requests are served one at a time, so
-//! concurrent fragments never share decoder, model or encoder state.
+//! concurrent fragments never share decoder, model or encoder state. What a
+//! request produces goes back through a channel of its own, part by part.
 
 pub mod h264;
 pub mod mp4;
@@ -13,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use crate::gpu::Gpu;
 use crate::state::{LastJob, Runtime, Shared};
-pub use pipeline::Outcome;
-use pipeline::Session;
+use pipeline::{Control, Event, Models, Outcome, Session, Speeds};
+pub use pipeline::{Position, Start, Summary};
 
 /// GPU memory held for a stream is released after this long without work.
 const IDLE: Duration = Duration::from_secs(45);
@@ -27,7 +28,56 @@ struct Job {
     data: Vec<u8>,
     quality: u8,
     target: (u32, u32),
-    reply: mpsc::Sender<Result<Outcome, String>>,
+    rate: f64,
+    reply: mpsc::Sender<Reply>,
+    control: Arc<Control>,
+}
+
+/// What the caller is told about its fragment, in this order: either
+/// `Passthrough`, or `Start`, the parts and `Done`. `Failed` can come at any
+/// point and ends it: whatever came before is then not to be relied on.
+pub enum Reply {
+    /// Leave the original alone. `why` is for the status display; `src` is
+    /// the video's size, when the input got far enough to tell.
+    Passthrough {
+        why: String,
+        src: Option<(u32, u32)>,
+    },
+    Start(Start),
+    /// `moof`+`mdat` with the next frames; `last` on the final one.
+    Part {
+        media: Vec<u8>,
+        last: bool,
+    },
+    Done(Summary),
+    Failed(String),
+}
+
+/// A fragment that is being worked on.
+pub struct Ticket {
+    pub replies: mpsc::Receiver<Reply>,
+    pub handle: Handle,
+}
+
+/// The caller's say in the work on its fragment. Dropping it stops the
+/// work: then nobody is left who wants the rest.
+pub struct Handle(Arc<Control>);
+
+impl Handle {
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    /// The player has moved on.
+    pub fn set_position(&self, position: Position) {
+        self.0.set_position(position);
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 pub struct Engine {
@@ -44,25 +94,33 @@ impl Engine {
         Engine { jobs }
     }
 
-    /// Upscales one fragment (init segment + `moof`/`mdat`); blocks until done.
-    pub fn transform(
+    /// Queues one fragment (init segment + `moof`/`mdat`) for upscaling;
+    /// the ticket's channel tells how it goes. `rate` is the speed the
+    /// player plays at (1.0 is normal) and `position` where it is.
+    pub fn submit(
         &self,
         data: Vec<u8>,
         quality: u8,
         target: (u32, u32),
-    ) -> Result<Outcome, String> {
-        let (reply, result) = mpsc::channel();
-        self.jobs
-            .send(Job {
-                data,
-                quality,
-                target,
-                reply,
-            })
-            .map_err(|_| "the GPU thread has stopped".to_string())?;
-        result
-            .recv()
-            .map_err(|_| "the GPU thread has stopped".to_string())?
+        rate: f64,
+        position: Position,
+    ) -> Ticket {
+        let (reply, replies) = mpsc::channel();
+        let control = Arc::new(Control::new(position));
+        // If the GPU thread is gone the job is dropped here, and the
+        // ticket's channel says so by being closed.
+        let _ = self.jobs.send(Job {
+            data,
+            quality,
+            target,
+            rate,
+            reply,
+            control: control.clone(),
+        });
+        Ticket {
+            replies,
+            handle: Handle(control),
+        }
     }
 }
 
@@ -71,9 +129,8 @@ struct Worker {
     gpu: Option<Gpu>,
     gpu_failed: Option<(Instant, String)>,
     sessions: Vec<(u64, Session)>,
-    /// Highest mode the GPU has kept up with, and for which requested mode.
-    speed_cap: (u8, u8),
-    slow_streak: u32,
+    models: Models,
+    speeds: Speeds,
 }
 
 impl Worker {
@@ -83,8 +140,8 @@ impl Worker {
             gpu: None,
             gpu_failed: None,
             sessions: Vec::new(),
-            speed_cap: (4, 0),
-            slow_streak: 0,
+            models: Models::default(),
+            speeds: Speeds::default(),
         }
     }
 
@@ -92,21 +149,32 @@ impl Worker {
         loop {
             match rx.recv_timeout(IDLE) {
                 Ok(job) => {
+                    if job.control.cancelled() {
+                        continue; // given up on while it waited
+                    }
                     // A bug in here must not take the proxy down with it.
+                    let mut started = false;
                     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.handle(&job)
+                        self.handle(&job, &mut started)
                     }));
                     let result = attempt.unwrap_or_else(|_| {
                         self.sessions.clear();
+                        self.models.clear();
                         Err("internal error while processing a fragment".into())
                     });
                     self.record(&job, &result);
-                    let _ = job.reply.send(result);
+                    let _ = job.reply.send(match result {
+                        Ok(Outcome::Done(summary)) => Reply::Done(summary),
+                        // The caller has parts of an upscaled fragment by now.
+                        Ok(Outcome::Passthrough { why, .. }) if started => Reply::Failed(why),
+                        Ok(Outcome::Passthrough { why, src }) => Reply::Passthrough { why, src },
+                        Ok(Outcome::Cancelled) => continue,
+                        Err(e) => Reply::Failed(e),
+                    });
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     self.sessions.clear();
-                    self.speed_cap = (4, 0);
-                    self.shared.stats.lock().unwrap().slowed_to = None;
+                    self.models.clear();
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -140,18 +208,14 @@ impl Worker {
         Ok(self.gpu.as_ref())
     }
 
-    fn handle(&mut self, job: &Job) -> Result<Outcome, String> {
+    /// `started` is set once a part of the output has gone to the caller.
+    fn handle(&mut self, job: &Job, started: &mut bool) -> Result<Outcome, String> {
         let Some(key) = pipeline::stream_key(&job.data) else {
             return Ok(Outcome::Passthrough {
                 why: "no init segment".into(),
                 src: None,
             });
         };
-        if self.speed_cap.1 != job.quality {
-            self.speed_cap = (4, job.quality);
-            self.slow_streak = 0;
-        }
-        let quality = job.quality.min(self.speed_cap.0);
         if self.open_gpu()?.is_none() {
             let why = "the NVIDIA runtime is not installed".into();
             return Ok(Outcome::Passthrough { why, src: None });
@@ -171,21 +235,38 @@ impl Worker {
                 self.sessions.len() - 1
             }
         };
+        let request = pipeline::Request {
+            data: &job.data,
+            quality: job.quality,
+            target: job.target,
+            rate: job.rate,
+            control: &job.control,
+        };
         let result = pipeline::transform(
             gpu,
             &mut self.sessions[index].1,
-            &job.data,
-            quality,
-            job.target,
+            &mut self.models,
+            &mut self.speeds,
+            &request,
+            &mut |event| {
+                *started = true;
+                job.reply
+                    .send(match event {
+                        Event::Start(start) => Reply::Start(start),
+                        Event::Part { media, last } => Reply::Part { media, last },
+                    })
+                    .is_ok()
+            },
         );
         if result.is_err() {
             // Whatever state the failure left behind is not worth trusting.
             self.sessions.remove(index);
+            self.models.clear();
         }
         result
     }
 
-    fn record(&mut self, job: &Job, result: &Result<Outcome, String>) {
+    fn record(&self, job: &Job, result: &Result<Outcome, String>) {
         let mut stats = self.shared.stats.lock().unwrap();
         match result {
             Ok(Outcome::Done(out)) => {
@@ -203,19 +284,9 @@ impl Worker {
                     fps: out.frames as f64 / out.work_seconds.max(1e-6),
                     realtime,
                 });
-                // Slower than playback twice in a row: step the mode down
-                // rather than let the video stall.
-                if realtime < 1.0 && out.mode > 1 {
-                    self.slow_streak += 1;
-                    if self.slow_streak >= 2 {
-                        self.speed_cap.0 = out.mode - 1;
-                        self.slow_streak = 0;
-                        stats.slowed_to = Some(out.mode - 1);
-                    }
-                } else {
-                    self.slow_streak = 0;
-                }
+                stats.slowed_to = out.slowed.then_some(out.mode);
             }
+            Ok(Outcome::Cancelled) => {}
             Ok(Outcome::Passthrough { why, .. }) => stats.skipped = Some(why.clone()),
             Err(e) => stats.error = Some(e.clone()),
         }

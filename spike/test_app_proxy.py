@@ -13,6 +13,9 @@ port and sends it segments the way the extension does: init + one bare
   - the picture is the same picture: colours match the source,
   - a page on a smaller display than the chosen resolution gets that
     display's resolution (checked for every display of this machine),
+  - asked for in parts, a fragment comes back as the same frames, the first
+    of them long before the last; what is behind the playhead changes
+    nothing but the speed; and a fragment that is called off is dropped,
   - audio, and video that already fills the target, come back as 204,
   - a web page (as opposed to an extension) is refused.
 
@@ -123,17 +126,34 @@ def first_tfdt(data):
     return tfdt, timescale
 
 
-def post(body, query="", origin="chrome-extension://test"):
-    """-> (status, bytes, meta)"""
-    req = urllib.request.Request(f"{BASE}/transform{query}", data=body, method="POST")
+def call(path, body=b"", origin="chrome-extension://test"):
+    """-> (status, bytes, meta, the name to ask for the next part by)"""
+    req = urllib.request.Request(BASE + path, data=body, method="POST")
     if origin:
         req.add_header("Origin", origin)
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             meta = json.loads(r.headers.get("X-VSR-Meta") or "null")
-            return r.status, r.read(), meta
+            return r.status, r.read(), meta, r.headers.get("X-VSR-Next")
     except urllib.error.HTTPError as e:
-        return e.code, e.read(), None
+        return e.code, e.read(), None, None
+
+
+def post(body, query="", origin="chrome-extension://test"):
+    """-> (status, bytes, meta)"""
+    return call("/transform" + query, body, origin)[:3]
+
+
+def post_in_parts(body, query=""):
+    """The way the extension asks. -> (status, [part, ...], meta of the last,
+    seconds until the first part, seconds until the last)"""
+    t0 = time.time()
+    status, part, meta, more = call("/transform?parts=1" + query, body)
+    first, parts = time.time() - t0, [part]
+    while status == 200 and more:
+        status, part, meta, more = call(f"/transform/next?job={more}")
+        parts.append(part)
+    return status, parts, meta, first, time.time() - t0
 
 
 def get(path):
@@ -244,6 +264,23 @@ def main():
         ok &= same
         print(f"output init segment identical across segments: {same}")
 
+        # In parts: the same frames, and the first of them early.
+        src = init + chunks[1]
+        whole = post(src)[1]
+        status, parts, meta, first, last = post_in_parts(src)
+        joined = b"".join(parts)
+        expect("in parts: the same frames at the same times",
+               (status, packets(joined) == packets(whole)), (200, True))
+        expect("in parts: more than one, starting with the init segment and 0.4 s of video",
+               (len(parts) > 1, parts[0][:meta["init_len"]] in inits,
+                len(packets(parts[0])[0]) >= 12, meta["frames"]),
+               (True, True, True, 60))
+        print(f"  {len(parts)} parts, the first after {first * 1000:.0f} ms, the last after {last * 1000:.0f} ms")
+        status, parts, meta, _, _ = post_in_parts(src, "&behind=1.5&rate=2")
+        expect("behind the playhead and double speed: still the same frames at the same times",
+               (status, packets(b"".join(parts)) == packets(whole)), (200, True))
+        expect("a fragment nobody is fetching has no next part", call("/transform/next?job=12345")[0], 410)
+
         # A screen that is none of this machine's displays changes nothing.
         status, out, meta = post(init + chunks[1], "?sw=1024&sh=600&dpr=1")
         expect("unknown screen keeps the target", (status, meta and meta["out"]), (200, "1280x720"))
@@ -286,6 +323,24 @@ def main():
             status, out, meta = post(init + chunks[0], query)
             expect(f"page on {d['name']} ({d['width']}x{d['height']}), target {cfg['target'][0]}x{cfg['target'][1]}",
                    (status, meta and meta["out"]), (200, want))
+
+        # A long fragment that is called off after its first part (the player
+        # seeked away): the work stops, and the next fragment does not wait.
+        long = init + b"".join(chunks)
+        t0 = time.time()
+        post(long)
+        whole = time.time() - t0
+        before = get("/status")["total_frames"]
+        status, part, meta, job = call("/transform?parts=1", long)
+        t0 = time.time()
+        call(f"/transform/cancel?job={job}")
+        gone = call(f"/transform/next?job={job}")[0]
+        status, out, meta = post(init + chunks[0])
+        waited = time.time() - t0
+        expect("a fragment that was called off is gone", (gone, status), (410, 200))
+        expect("and was not finished", get("/status")["total_frames"] - before, meta["frames"])
+        print(f"  the whole of it takes {whole:.2f} s; the fragment after the cancelled one came in {waited:.2f} s")
+        ok &= waited < whole / 2
     finally:
         stop_app(app, config)
     print("PASS" if ok else "FAIL")

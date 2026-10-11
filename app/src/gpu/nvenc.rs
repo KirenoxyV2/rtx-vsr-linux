@@ -110,14 +110,27 @@ pub struct EncoderConfig {
     pub matrix: u8,
 }
 
+/// One picture's worth of encoder buffers: where the caller writes it and
+/// where its bitstream comes out.
+struct Slot {
+    input: CUdeviceptr,
+    registered: *mut c_void,
+    /// Set while the encoder reads the picture.
+    mapped: *mut c_void,
+    bitstream: *mut c_void,
+}
+
 pub struct Encoder {
     nvenc: Rc<Nvenc>,
     cuda: Rc<Cuda>,
     session: *mut c_void,
-    input: CUdeviceptr,
     pitch: u32,
-    registered: *mut c_void,
-    bitstream: *mut c_void,
+    /// Two, so that the next picture can be prepared while this one encodes.
+    slots: [Slot; 2],
+    /// The slot the next `submit` reads.
+    next: usize,
+    /// A picture is being encoded (in the other slot).
+    busy: bool,
     config: EncoderConfig,
     /// SPS and PPS NAL units (without start codes).
     pub sps: Vec<u8>,
@@ -133,10 +146,15 @@ impl Encoder {
             nvenc,
             cuda,
             session: std::ptr::null_mut(),
-            input: 0,
             pitch: config.width.next_multiple_of(64),
-            registered: std::ptr::null_mut(),
-            bitstream: std::ptr::null_mut(),
+            slots: std::array::from_fn(|_| Slot {
+                input: 0,
+                registered: std::ptr::null_mut(),
+                mapped: std::ptr::null_mut(),
+                bitstream: std::ptr::null_mut(),
+            }),
+            next: 0,
+            busy: false,
             config,
             sps: Vec::new(),
             pps: Vec::new(),
@@ -231,31 +249,33 @@ impl Encoder {
             "initialising the encoder",
         )?;
 
-        let mut bs: nv::NV_ENC_CREATE_BITSTREAM_BUFFER = zeroed();
-        bs.version = CREATE_BITSTREAM_BUFFER_VER;
-        self.check(
-            api.nvEncCreateBitstreamBuffer
-                .ok_or("NVENC API incomplete")?(self.session, &mut bs),
-            "creating the output buffer",
-        )?;
-        self.bitstream = bs.bitstreamBuffer;
-
         let bytes = self.pitch as usize * c.height as usize * 3 / 2;
-        self.input = self.cuda.alloc(bytes)?;
-        let mut reg: Box<nv::NV_ENC_REGISTER_RESOURCE> = Box::new(zeroed());
-        reg.version = REGISTER_RESOURCE_VER;
-        reg.resourceType = nv::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
-        reg.width = c.width;
-        reg.height = c.height;
-        reg.pitch = self.pitch;
-        reg.resourceToRegister = self.input as *mut c_void;
-        reg.bufferFormat = nv::NV_ENC_BUFFER_FORMAT_NV12;
-        reg.bufferUsage = nv::NV_ENC_INPUT_IMAGE;
-        self.check(
-            api.nvEncRegisterResource.ok_or("NVENC API incomplete")?(self.session, &mut *reg),
-            "registering the input buffer",
-        )?;
-        self.registered = reg.registeredResource;
+        for i in 0..self.slots.len() {
+            let mut bs: nv::NV_ENC_CREATE_BITSTREAM_BUFFER = zeroed();
+            bs.version = CREATE_BITSTREAM_BUFFER_VER;
+            self.check(
+                api.nvEncCreateBitstreamBuffer
+                    .ok_or("NVENC API incomplete")?(self.session, &mut bs),
+                "creating the output buffer",
+            )?;
+            self.slots[i].bitstream = bs.bitstreamBuffer;
+
+            self.slots[i].input = self.cuda.alloc(bytes)?;
+            let mut reg: Box<nv::NV_ENC_REGISTER_RESOURCE> = Box::new(zeroed());
+            reg.version = REGISTER_RESOURCE_VER;
+            reg.resourceType = nv::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+            reg.width = c.width;
+            reg.height = c.height;
+            reg.pitch = self.pitch;
+            reg.resourceToRegister = self.slots[i].input as *mut c_void;
+            reg.bufferFormat = nv::NV_ENC_BUFFER_FORMAT_NV12;
+            reg.bufferUsage = nv::NV_ENC_INPUT_IMAGE;
+            self.check(
+                api.nvEncRegisterResource.ok_or("NVENC API incomplete")?(self.session, &mut *reg),
+                "registering the input buffer",
+            )?;
+            self.slots[i].registered = reg.registeredResource;
+        }
 
         let mut buf = [0u8; 1024];
         let mut size = 0u32;
@@ -285,28 +305,35 @@ impl Encoder {
         &self.config
     }
 
-    /// The picture the next `encode` call will read.
+    /// The picture the next `submit` call will read.
     pub fn input(&self) -> Nv12 {
         Nv12 {
-            ptr: self.input,
+            ptr: self.slots[self.next].input,
             pitch: self.pitch,
             uv_offset: self.pitch as u64 * self.config.height as u64,
         }
     }
 
-    /// Encodes the input picture; appends its access unit (Annex B) to `out`
-    /// and returns whether it is an IDR picture.
-    pub fn encode(&mut self, pts: u64, force_idr: bool, out: &mut Vec<u8>) -> Result<bool, String> {
+    /// Starts encoding the input picture and returns without waiting for it:
+    /// the encoder is hardware of its own, so the next picture can be worked
+    /// out (into `input`, which moves on to the other buffer) meanwhile.
+    /// `collect` must be called before the next `submit`.
+    pub fn submit(&mut self, pts: u64, force_idr: bool) -> Result<(), String> {
+        if self.busy {
+            return Err("NVENC: the previous picture was not collected".into());
+        }
         let nvenc = self.nvenc.clone();
         let api = &nvenc.api;
+        let slot = self.next;
         unsafe {
             let mut map: Box<nv::NV_ENC_MAP_INPUT_RESOURCE> = Box::new(zeroed());
             map.version = MAP_INPUT_RESOURCE_VER;
-            map.registeredResource = self.registered;
+            map.registeredResource = self.slots[slot].registered;
             self.check(
                 api.nvEncMapInputResource.ok_or("NVENC API incomplete")?(self.session, &mut *map),
                 "mapping the input buffer",
             )?;
+            self.slots[slot].mapped = map.mappedResource;
 
             let mut pic: Box<nv::NV_ENC_PIC_PARAMS> = Box::new(zeroed());
             pic.version = PIC_PARAMS_VER;
@@ -315,44 +342,69 @@ impl Encoder {
             pic.inputPitch = self.pitch;
             pic.inputTimeStamp = pts;
             pic.inputBuffer = map.mappedResource;
-            pic.outputBitstream = self.bitstream;
+            pic.outputBitstream = self.slots[slot].bitstream;
             pic.bufferFmt = map.mappedBufferFmt;
             pic.pictureStruct = nv::NV_ENC_PIC_STRUCT_FRAME;
             if force_idr {
                 pic.encodePicFlags =
                     nv::NV_ENC_PIC_FLAG_FORCEIDR | nv::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
             }
-            let mut result = self.check(
+            let result = self.check(
                 api.nvEncEncodePicture.ok_or("NVENC API incomplete")?(self.session, &mut *pic),
                 "encoding a frame",
             );
+            if result.is_err() {
+                self.unmap(slot);
+                return result;
+            }
+        }
+        self.busy = true;
+        self.next = 1 - slot;
+        Ok(())
+    }
 
+    /// Waits for the picture that `submit` started; appends its access unit
+    /// (Annex B) to `out` and returns whether it is an IDR picture. `None`
+    /// if no picture is being encoded.
+    pub fn collect(&mut self, out: &mut Vec<u8>) -> Result<Option<bool>, String> {
+        if !self.busy {
+            return Ok(None);
+        }
+        self.busy = false;
+        let nvenc = self.nvenc.clone();
+        let api = &nvenc.api;
+        let slot = 1 - self.next;
+        unsafe {
+            let mut lock: Box<nv::NV_ENC_LOCK_BITSTREAM> = Box::new(zeroed());
+            lock.version = LOCK_BITSTREAM_VER;
+            lock.outputBitstream = self.slots[slot].bitstream;
+            let result = self.check(
+                api.nvEncLockBitstream.ok_or("NVENC API incomplete")?(self.session, &mut *lock),
+                "reading the encoded frame",
+            );
             let mut keyframe = false;
             if result.is_ok() {
-                let mut lock: Box<nv::NV_ENC_LOCK_BITSTREAM> = Box::new(zeroed());
-                lock.version = LOCK_BITSTREAM_VER;
-                lock.outputBitstream = self.bitstream;
-                result = self.check(
-                    api.nvEncLockBitstream.ok_or("NVENC API incomplete")?(self.session, &mut *lock),
-                    "reading the encoded frame",
+                out.extend_from_slice(std::slice::from_raw_parts(
+                    lock.bitstreamBufferPtr as *const u8,
+                    lock.bitstreamSizeInBytes as usize,
+                ));
+                keyframe = lock.pictureType == nv::NV_ENC_PIC_TYPE_IDR;
+                api.nvEncUnlockBitstream.ok_or("NVENC API incomplete")?(
+                    self.session,
+                    self.slots[slot].bitstream,
                 );
-                if result.is_ok() {
-                    out.extend_from_slice(std::slice::from_raw_parts(
-                        lock.bitstreamBufferPtr as *const u8,
-                        lock.bitstreamSizeInBytes as usize,
-                    ));
-                    keyframe = lock.pictureType == nv::NV_ENC_PIC_TYPE_IDR;
-                    api.nvEncUnlockBitstream.ok_or("NVENC API incomplete")?(
-                        self.session,
-                        self.bitstream,
-                    );
-                }
             }
-            api.nvEncUnmapInputResource.ok_or("NVENC API incomplete")?(
-                self.session,
-                map.mappedResource,
-            );
-            result.map(|()| keyframe)
+            self.unmap(slot);
+            result.map(|()| Some(keyframe))
+        }
+    }
+
+    fn unmap(&mut self, slot: usize) {
+        let mapped = std::mem::replace(&mut self.slots[slot].mapped, std::ptr::null_mut());
+        if !mapped.is_null() {
+            if let Some(f) = self.nvenc.api.nvEncUnmapInputResource {
+                unsafe { f(self.session, mapped) };
+            }
         }
     }
 
@@ -384,24 +436,32 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
+        // A picture still being encoded has to be let through first.
+        let _ = self.collect(&mut Vec::new());
         let api = &self.nvenc.api;
-        unsafe {
-            if !self.session.is_null() {
-                if !self.registered.is_null() {
-                    if let Some(f) = api.nvEncUnregisterResource {
-                        f(self.session, self.registered);
+        for slot in &self.slots {
+            unsafe {
+                if !self.session.is_null() {
+                    if !slot.registered.is_null() {
+                        if let Some(f) = api.nvEncUnregisterResource {
+                            f(self.session, slot.registered);
+                        }
                     }
-                }
-                if !self.bitstream.is_null() {
-                    if let Some(f) = api.nvEncDestroyBitstreamBuffer {
-                        f(self.session, self.bitstream);
+                    if !slot.bitstream.is_null() {
+                        if let Some(f) = api.nvEncDestroyBitstreamBuffer {
+                            f(self.session, slot.bitstream);
+                        }
                     }
-                }
-                if let Some(f) = api.nvEncDestroyEncoder {
-                    f(self.session);
                 }
             }
         }
-        self.cuda.free(self.input);
+        if !self.session.is_null() {
+            if let Some(f) = api.nvEncDestroyEncoder {
+                unsafe { f(self.session) };
+            }
+        }
+        for slot in &self.slots {
+            self.cuda.free(slot.input);
+        }
     }
 }

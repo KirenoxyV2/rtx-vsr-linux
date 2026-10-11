@@ -5,6 +5,9 @@
  * to a fetch made from there. So it hands each segment to this script with
  * window.postMessage, and this script passes it on to the service worker,
  * which talks to the app. Extension messages are JSON, hence base64.
+ *
+ * The app's answer comes in parts: the first with the segment's request, each
+ * further one when the hook asks for it by the name the part before gave it.
  */
 (() => {
   "use strict";
@@ -50,18 +53,23 @@
     if (m.__vsr !== "req") return;
     const reply = (res, transfer) =>
       window.postMessage(Object.assign({ __vsr: "res", id: m.id }, res), "*", transfer || []);
+    // Either a segment, or the name of one that is on its way back: for its
+    // next part, or to say that the rest is not wanted.
+    // `behind`, `lead` and `rate` say what the player is doing (inject.js).
+    const msg = m.next ? { type: "transform", next: m.next, cancel: !!m.cancel, behind: m.behind, lead: m.lead }
+                       : { type: "transform", screen: m.screen, parts: !!m.parts,
+                           behind: m.behind, lead: m.lead, rate: m.rate,
+                           body: toB64(new Uint8Array(m.body)) };
     try {
-      chrome.runtime.sendMessage(
-        { type: "transform", screen: m.screen, body: toB64(new Uint8Array(m.body)) },
-        (res) => {
-          if (chrome.runtime.lastError || !res || !res.ok) {
-            return reply({ ok: false, passthrough: !!(res && res.passthrough), meta: res && res.meta });
-          }
-          const all = fromB64(res.body);
-          const init = all.slice(0, res.initLen), media = all.slice(res.initLen);
-          reply({ ok: true, init: init.buffer, media: media.buffer, meta: res.meta },
-                [init.buffer, media.buffer]);
-        });
+      chrome.runtime.sendMessage(msg, (res) => {
+        if (chrome.runtime.lastError || !res || !res.ok) {
+          return reply({ ok: false, passthrough: !!(res && res.passthrough), meta: res && res.meta });
+        }
+        const all = fromB64(res.body);
+        const init = all.slice(0, res.initLen || 0), media = all.slice(res.initLen || 0);
+        reply({ ok: true, init: init.buffer, media: media.buffer, meta: res.meta, next: res.next || null },
+              [init.buffer, media.buffer]);
+      });
     } catch (_) {   // extension reloaded under a live page
       reply({ ok: false });
     }

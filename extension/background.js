@@ -116,22 +116,43 @@ const requests = {
   appConfig,
 };
 
+// The app hands an upscaled segment back in parts, so that the first frames
+// can play while the last are still being made: the answer to a segment is
+// its first part, and names the segment (X-VSR-Next) if more is to come.
 async function transform(msg) {
   const cfg = await getConfig();
-  const body = Uint8Array.fromBase64 ? Uint8Array.fromBase64(msg.body)
-    : Uint8Array.from(atob(msg.body), (c) => c.charCodeAt(0));
-  // The screen the page is on: the app never upscales past what it can show.
-  const where = screenQuery(msg.screen);
-  const r = await fetch(`${cfg.proxy}/transform${where && "?" + where}`, { method: "POST", body });
+  // Where the player is: how much of the segment the playhead is past
+  // already, and how much video it has buffered in front of the playhead.
+  const where = [msg.behind > 0 ? "behind=" + (+msg.behind).toFixed(3) : "",
+                 typeof msg.lead === "number" && msg.lead >= 0 ? "lead=" + msg.lead.toFixed(3) : ""];
+  let r;
+  if (msg.next) {
+    const what = msg.cancel ? "cancel" : "next";
+    const query = ["job=" + encodeURIComponent(msg.next), ...where].filter(Boolean).join("&");
+    r = await fetch(`${cfg.proxy}/transform/${what}?${query}`, { method: "POST" });
+    if (msg.cancel) return { ok: false };
+  } else {
+    const body = Uint8Array.fromBase64 ? Uint8Array.fromBase64(msg.body)
+      : Uint8Array.from(atob(msg.body), (c) => c.charCodeAt(0));
+    // The screen the page is on: the app never upscales past what it can
+    // show. And the speed the video is played at, if it is not the usual.
+    const query = [screenQuery(msg.screen), msg.parts ? "parts=1" : "", ...where,
+                   msg.rate > 0 && msg.rate !== 1 ? "rate=" + (+msg.rate).toFixed(3) : ""]
+      .filter(Boolean).join("&");
+    r = await fetch(`${cfg.proxy}/transform${query && "?" + query}`, { method: "POST", body });
+  }
   let meta = null;
   try { meta = JSON.parse(r.headers.get("X-VSR-Meta")); } catch (_) {}
   if (r.status === 204) return { ok: false, passthrough: true, meta };
   if (!r.ok) throw new Error("app answered HTTP " + r.status);
   const out = new Uint8Array(await r.arrayBuffer());
-  // Whatever answers on that port must be the app: its reply says where the
-  // init segment ends. Anything else is not something to append.
-  const initLen = Number(r.headers.get("X-VSR-Init-Length"));
-  if (!(initLen > 0 && initLen < out.length)) throw new Error("the answer is not from the RTX VSR app");
+  // Whatever answers on that port must be the app: its reply to a segment
+  // says where the init segment ends. Anything else is not something to
+  // append.
+  const initLen = Number(r.headers.get("X-VSR-Init-Length")) || 0;
+  if (!(msg.next ? out.length > 8 : initLen > 0 && initLen < out.length)) {
+    throw new Error("the answer is not from the RTX VSR app");
+  }
   let b64;
   if (out.toBase64) b64 = out.toBase64();
   else {
@@ -139,7 +160,7 @@ async function transform(msg) {
     for (let i = 0; i < out.length; i += 0x8000) str += String.fromCharCode.apply(null, out.subarray(i, i + 0x8000));
     b64 = btoa(str);
   }
-  return { ok: true, body: b64, initLen, meta };
+  return { ok: true, body: b64, initLen, meta, next: r.headers.get("X-VSR-Next") || null };
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
