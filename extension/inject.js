@@ -18,7 +18,10 @@
  * H.264 from sites that prefer VP9/AV1, those are reported as unsupported.
  *
  * If the app's "indicator" setting is on, an "RTX VSR" mark is shown in the
- * top right corner of a video while the frames it shows are upscaled ones.
+ * top right corner of a video for as long as upscaled frames are playing in
+ * it: it fades out when the video pauses, ends or waits for data, when it
+ * comes to frames that were not upscaled, and when the app is switched off
+ * or gone.
  */
 (() => {
   "use strict";
@@ -58,7 +61,8 @@
     const m = ev.data;
     if (ev.source !== window || !m) return;
     if (m.__vsr === "cfgres") {
-      if (m.config) stats.indicator = !!(m.config.indicator && m.config.enabled);
+      // No answer: the app is not running, so nothing is being upscaled.
+      stats.indicator = !!(m.config && m.config.indicator && m.config.enabled);
       if (typeof m.mark === "string") markUrl = m.mark;
       return;
     }
@@ -122,6 +126,90 @@
     return { type, end: pos + size };
   }
 
+  // ---- when a fragment plays ---------------------------------------------------
+  const u32 = (b, p) => ((b[p] << 24) | (b[p + 1] << 16) | (b[p + 2] << 8) | b[p + 3]) >>> 0;
+  const u64 = (b, p) => u32(b, p) * 4294967296 + u32(b, p + 4);
+  /* The boxes in buf[pos, end). */
+  function boxesIn(buf, pos, end) {
+    const out = [];
+    while (pos + 8 <= end) {
+      let size = u32(buf, pos), body = pos + 8;
+      if (size === 1) { size = u64(buf, pos + 8); body = pos + 16; }
+      if (size < body - pos || pos + size > end) break;
+      out.push({ type: String.fromCharCode(buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]),
+                 body, end: pos + size });
+      pos += size;
+    }
+    return out;
+  }
+  const boxIn = (buf, parent, type) => boxesIn(buf, parent.body, parent.end).find((b) => b.type === type);
+
+  /* What an init segment says about the times of its video track's fragments,
+   * or null if it has no such track. */
+  function clockOf(init) {
+    const moov = boxesIn(init, 0, init.length).find((b) => b.type === "moov");
+    for (const trak of boxesIn(init, moov.body, moov.end)) {
+      const mdia = trak.type === "trak" && boxIn(init, trak, "mdia");
+      const hdlr = mdia && boxIn(init, mdia, "hdlr");
+      if (!hdlr || u32(init, hdlr.body + 8) !== 0x76696465) continue;   // "vide"
+      const tkhd = boxIn(init, trak, "tkhd"), mdhd = boxIn(init, mdia, "mdhd");
+      const clock = {
+        track: u32(init, tkhd.body + (init[tkhd.body] === 1 ? 20 : 12)),
+        scale: u32(init, mdhd.body + (init[mdhd.body] === 1 ? 20 : 12)),
+        duration: 0,     // of a sample, unless the fragment says
+        edit: 0,         // subtracted from every presentation time
+      };
+      const edts = boxIn(init, trak, "edts"), elst = edts && boxIn(init, edts, "elst");
+      if (elst && u32(init, elst.body + 4) > 0) {
+        const long = init[elst.body] === 1;
+        const negative = init[elst.body + (long ? 16 : 12)] & 0x80;   // an empty edit
+        if (!negative) clock.edit = long ? u64(init, elst.body + 16) : u32(init, elst.body + 12);
+      }
+      const mvex = boxIn(init, moov, "mvex");
+      for (const trex of mvex ? boxesIn(init, mvex.body, mvex.end) : []) {
+        if (trex.type === "trex" && u32(init, trex.body + 4) === clock.track) {
+          clock.duration = u32(init, trex.body + 12);
+        }
+      }
+      return clock.scale ? clock : null;
+    }
+    return null;
+  }
+
+  /* The stretch of the video's timeline, in seconds, that the samples of a
+   * moof box are presented in. */
+  function spanOf(clock, buf) {
+    let from = Infinity, to = -Infinity;
+    const moof = boxesIn(buf, 0, buf.length)[0];
+    for (const traf of boxesIn(buf, moof.body, moof.end)) {
+      const tfhd = traf.type === "traf" && boxIn(buf, traf, "tfhd");
+      const tfdt = tfhd && boxIn(buf, traf, "tfdt");
+      if (!tfdt || u32(buf, tfhd.body + 4) !== clock.track) continue;
+      const has = u32(buf, tfhd.body) & 0xffffff;
+      const fixed = has & 0x8 ? u32(buf, tfhd.body + 8 + (has & 0x1 ? 8 : 0) + (has & 0x2 ? 4 : 0))
+                              : clock.duration;
+      let dts = buf[tfdt.body] === 1 ? u64(buf, tfdt.body + 4) : u32(buf, tfdt.body + 4);
+      for (const trun of boxesIn(buf, traf.body, traf.end)) {
+        if (trun.type !== "trun") continue;
+        const flags = u32(buf, trun.body) & 0xffffff, count = u32(buf, trun.body + 4);
+        // Per sample, each if flagged: duration, size, flags, composition offset.
+        const step = 4 * [0x100, 0x200, 0x400, 0x800].filter((f) => flags & f).length;
+        let p = trun.body + 8 + (flags & 0x1 ? 4 : 0) + (flags & 0x4 ? 4 : 0);
+        if (p + count * step > trun.end) return null;
+        for (let i = 0; i < count; i++, p += step) {
+          const duration = flags & 0x100 ? u32(buf, p) : fixed;
+          let shift = flags & 0x800 ? u32(buf, p + step - 4) : 0;
+          if (buf[trun.body] !== 0) shift |= 0;      // signed from version 1 on
+          const pts = dts + shift - clock.edit;
+          from = Math.min(from, pts);
+          to = Math.max(to, pts + duration);
+          dts += duration;
+        }
+      }
+    }
+    return to > from ? [from / clock.scale, to / clock.scale] : null;
+  }
+
   // ---- per-SourceBuffer state -----------------------------------------------
   const states = new WeakMap();
   const streams = new WeakMap();   // MediaSource -> states of its SourceBuffers
@@ -130,15 +218,26 @@
   function setType(sb, type) {
     let st = states.get(sb);
     if (!st) {
-      st = { busy: false, gen: 0, sizes: new Set() };
+      // `sizes` and `spans` are what the indicator goes by: the sizes of the
+      // upscaled video appended here, and the stretches of the timeline it
+      // was appended for.
+      st = { busy: false, gen: 0, sizes: new Set(), spans: [] };
       states.set(sb, st);
     }
     st.intercept = wanted(type);
+    if (!st.intercept) forget(st);
     resetParser(st);
     st.init = null;        // the page's init segment (ftyp+moov)
+    st.clock = null;       // its timing, for `spanOf`
     st.initParts = [];
     st.ours = null;        // app's init segment currently in effect, if any
     return st;
+  }
+  /* From here on appends are not looked at, so what is in the buffer is not
+   * known any more. */
+  function forget(st) {
+    st.sizes.clear();
+    st.spans = [];
   }
   function resetParser(st) {
     st.acc = new Uint8Array(0);   // bytes not yet forming a complete box
@@ -164,16 +263,57 @@
     };
   }
 
-  /* Turn newly appended bytes into the bytes to really append (maybe none yet). */
-  async function process(st, bytes) {
+  /* Where on the timeline the fragment waiting in `st.moof` goes, or null if
+   * that cannot be told. */
+  function playsAt(sb, st) {
+    try {
+      if (sb.mode !== "segments") return null;    // "sequence": wherever the last one ended
+      const span = st.clock && spanOf(st.clock, st.moof);
+      return span && span.map((t) => t + sb.timestampOffset);
+    } catch (_) { return null; }
+  }
+
+  /* Takes note of fragments that have been appended: { span, out, src }, with
+   * `out` the size of an upscaled one and `src` that of an original. */
+  function remember(st, notes) {
+    for (const { span, out, src } of notes) {
+      if (out) st.sizes.add(out);
+      if (!span) st.spans = null;         // times unknown: sizes alone decide from now on
+      if (!st.spans) {
+        // Originals of this size are in the buffer now: it no longer tells
+        // upscaled frames apart.
+        if (!out && src) st.sizes.delete(src);
+        continue;
+      }
+      // The fragment replaces whatever was there for its stretch of time.
+      const [a, b] = span, spans = [];
+      for (const [s, e] of st.spans) {
+        if (s < a) spans.push([s, Math.min(e, a)]);
+        if (e > b) spans.push([Math.max(s, b), e]);
+      }
+      if (out) spans.push([a, b]);
+      spans.sort((x, y) => x[0] - y[0]);
+      st.spans = [];
+      for (const span of spans) {
+        const last = st.spans[st.spans.length - 1];
+        if (last && span[0] <= last[1] + 0.001) last[1] = Math.max(last[1], span[1]);
+        else st.spans.push(span);
+      }
+    }
+  }
+
+  /* Turn newly appended bytes into the bytes to really append (maybe none
+   * yet), with notes on the fragments among them (see `remember`). */
+  async function process(sb, st, bytes) {
     const buf = st.acc.length ? concat([st.acc, bytes]) : bytes;
-    const out = [];
+    const out = [], notes = [];
     let pos = 0;
     for (;;) {
       const box = boxAt(buf, pos);
       if (!box) break;
       if (box.bad) {             // not ISO-BMFF after all: stop interfering
         st.intercept = false;
+        forget(st);
         out.push(buf.subarray(pos));
         pos = buf.length;
         break;
@@ -186,6 +326,7 @@
           st.init = concat(st.initParts);
           st.initParts = [];
           st.ours = null;
+          try { st.clock = clockOf(st.init); } catch (_) { st.clock = null; }
           out.push(st.init);
         }
       } else if (box.type === "moof") {
@@ -193,6 +334,7 @@
       } else if (box.type === "mdat" && st.moof && st.init) {
         const fragment = concat([st.moof, data]);
         const original = concat([...st.head, fragment]);
+        const span = playsAt(sb, st);
         st.moof = null;
         st.head = [];
         const res = stats.off ? { failed: false } : await transform(concat([st.init, fragment]));
@@ -205,11 +347,9 @@
           stats.transformed++;
           stats.failures = 0;
           stats.last = res.meta;
-          if (res.meta) {
-            // Frames of this size are upscaled ones (see the indicator).
-            if (res.meta.out) st.sizes.add(res.meta.out);
-            if ("indicator" in res.meta) stats.indicator = !!res.meta.indicator;
-          }
+          // Frames of this size, at these times, are upscaled ones.
+          notes.push({ span, out: res.meta && res.meta.out });
+          if (res.meta && "indicator" in res.meta) stats.indicator = !!res.meta.indicator;
           watchVideos();
         } else {
           if (res.failed && ++stats.failures >= MAX_FAILURES) {
@@ -221,9 +361,7 @@
             st.ours = null;
           }
           out.push(original);
-          // Originals of this size are in the buffer now: it no longer
-          // tells upscaled frames apart (see the indicator).
-          if (res.meta && res.meta.in) st.sizes.delete(res.meta.in);
+          notes.push({ span, src: res.meta && res.meta.in });
           stats.passthrough++;
         }
       } else if (st.moof || !st.init) {
@@ -233,7 +371,7 @@
       }
     }
     st.acc = buf.slice(pos);
-    return concat(out);
+    return { bytes: concat(out), notes };
   }
 
   // ---- the SourceBuffer facade ------------------------------------------------
@@ -255,7 +393,7 @@
    * the original would have fitted: then the page keeps seeing `updating`
    * and the append is retried as playback frees space, which is the pace the
    * player would have settled on by itself. */
-  function finishAppend(sb, st, gen, out) {
+  function finishAppend(sb, st, gen, out, notes) {
     if (st.gen !== gen) return;          // aborted meanwhile
     // The real append fires its own updatestart; the page already had ours.
     const swallow = (ev) => ev.stopImmediatePropagation();
@@ -263,10 +401,11 @@
     try {
       origAppend.call(sb, out);
       st.busy = false;
+      remember(st, notes);
     } catch (e) {
       sb.removeEventListener("updatestart", swallow, { capture: true });
       if (e && e.name === "QuotaExceededError") {
-        setTimeout(() => finishAppend(sb, st, gen, out), 1000);
+        setTimeout(() => finishAppend(sb, st, gen, out, notes), 1000);
         return;
       }
       st.busy = false;
@@ -283,17 +422,18 @@
     const gen = st.gen;
     st.busy = true;
     queueMicrotask(() => { if (st.gen === gen) fire(sb, ["updatestart"]); });
-    process(st, bytes).catch((e) => {
+    process(sb, st, bytes).catch((e) => {
       console.warn("[vsr] passing through after error:", e);
       st.intercept = false;
-      return bytes;
+      forget(st);
+      return { bytes, notes: [] };
     }).then((out) => {
       if (st.gen !== gen) return;        // aborted meanwhile
-      if (!out.length) {
+      if (!out.bytes.length) {
         st.busy = false;
         return fire(sb, ["update", "updateend"]);
       }
-      finishAppend(sb, st, gen, out);
+      finishAppend(sb, st, gen, out.bytes, out.notes);
     });
   };
 
@@ -344,20 +484,30 @@
   };
 
   /* Is this element showing upscaled frames right now? The decoded size is
-   * the proof: the app's output is larger than anything the page appended. */
+   * the proof: the app's output is larger than what the page appended for it.
+   * A larger original can be of that size too, so the frames must also be
+   * from a stretch of the timeline that upscaled video was appended for. */
   function upscaled(video) {
     if (!video.videoWidth || video.readyState < 2) return false;
     const ref = sources.get(video.currentSrc || video.src);
     const list = ref && ref.deref() && streams.get(ref.deref());
-    const size = video.videoWidth + "x" + video.videoHeight;
-    return !!list && list.some((st) => st.sizes.has(size));
+    const size = video.videoWidth + "x" + video.videoHeight, t = video.currentTime;
+    return !!list && list.some((st) => st.sizes.has(size)
+      && (!st.spans || st.spans.some(([from, to]) => t > from - 0.05 && t < to + 0.05)));
   }
+  /* …and are they moving? Not while it is paused, at its end or waiting for
+   * data (which is also what a seek looks like until it lands). */
+  const live = (video) => !video.paused && !video.ended && video.readyState > 2 && upscaled(video);
 
-  const marks = new WeakMap();     // <video> -> its indicator element
+  const FADE_MS = 250;
+  const marks = new Map();         // <video> -> its indicator element
   function makeMark() {
     // Styled through style properties only (pages may forbid inline style
     // attributes), and with everything a page's own rules for images could
-    // add to it switched off.
+    // add to it switched off. It is in the page from its first appearance
+    // on, shown and hidden by opacity so that both can be gradual;
+    // `visibility` follows at the end of a fade out and the start of a
+    // fade in.
     const el = document.createElement("img");
     el.setAttribute("data-rtx-vsr-indicator", "");
     el.setAttribute("aria-hidden", "true");
@@ -365,25 +515,31 @@
     el.draggable = false;
     el.src = markUrl;
     Object.assign(el.style, {
-      position: "absolute", zIndex: "2147483000", display: "none", pointerEvents: "none",
-      opacity: "0.7", userSelect: "none", margin: "0", padding: "0", border: "0",
+      position: "absolute", zIndex: "2147483000", display: "block", pointerEvents: "none",
+      opacity: "0", visibility: "hidden", userSelect: "none", margin: "0", padding: "0", border: "0",
       borderRadius: "0", background: "none", boxShadow: "none", filter: "none",
       maxWidth: "none", maxHeight: "none", minWidth: "0", minHeight: "0",
-      transform: "none", transition: "none",
+      transform: "none", animation: "none",
+      transition: `opacity ${FADE_MS}ms ease, visibility ${FADE_MS}ms`,
     });
     return el;
+  }
+  function fade(el, shown) {
+    el.style.opacity = shown ? "0.7" : "0";
+    el.style.visibility = shown ? "visible" : "hidden";
   }
 
   function placeMark(video) {
     let el = marks.get(video);
     const host = video.offsetParent;   // null while the element is not laid out
-    const show = stats.indicator && !!markUrl && !!host && video.clientWidth > 0 && upscaled(video);
+    const show = stats.indicator && !!markUrl && !!host && video.clientWidth > 0 && live(video);
     if (!show) {
-      if (el) el.style.display = "none";
+      if (el) fade(el, false);         // where it is
       return;
     }
     if (!el) marks.set(video, el = makeMark());
-    if (el.parentNode !== host) host.appendChild(el);
+    const moved = el.parentNode !== host;
+    if (moved) host.appendChild(el);
     // The picture's box inside the element (letterboxed unless told otherwise).
     const ew = video.clientWidth, eh = video.clientHeight;
     let w = ew, h = eh;
@@ -398,32 +554,49 @@
     const left = video.offsetLeft + video.clientLeft + (ew - w) / 2 + w - side - gap;
     const top = video.offsetTop + video.clientTop + (eh - h) / 2 + gap;
     Object.assign(el.style, {
-      display: "block", left: Math.round(left) + "px", top: Math.round(top) + "px",
+      left: Math.round(left) + "px", top: Math.round(top) + "px",
       width: side + "px", height: side + "px",
     });
+    // A fade starts from what the browser last worked out for the element:
+    // for one that has just been put in the page, that has to be asked for.
+    if (moved) void el.offsetWidth;
+    fade(el, true);
   }
+  const tryPlace = (video) => { try { placeMark(video); } catch (_) {} };
 
   let watching = false, ticks = 0, wasPlaying = false;
   function watchVideos() {         // started by the first upscaled fragment
     if (watching) return;
     watching = true;
+    // A video says when it stops and starts (these events do not bubble, but
+    // they can be caught on their way down); the timer sees the rest, such
+    // as playback coming to frames that are not upscaled.
+    for (const name of ["playing", "pause", "waiting", "seeking", "ended", "emptied", "resize"]) {
+      document.addEventListener(name, (ev) => {
+        if (ev.target instanceof HTMLVideoElement) tryPlace(ev.target);
+      }, true);
+    }
     setInterval(() => {
+      for (const [video, el] of marks) {
+        if (video.isConnected) continue;
+        el.remove();               // its video has left the page
+        marks.delete(video);
+      }
       let playing = false;
       for (const video of document.querySelectorAll("video")) {
-        try {
-          placeMark(video);
-          playing = playing || (!document.hidden && !video.paused && !video.ended && upscaled(video));
-        } catch (_) {}
+        tryPlace(video);
+        try { playing = playing || (!document.hidden && live(video)); } catch (_) {}
       }
-      // Ask for the app's settings now and then (they may change while
-      // nothing is being appended), and tell it whether upscaled video is
-      // playing here and on which screen: its window mentions a smaller
-      // display only while something is being watched on one.
+      // Ask for the app's settings every second (they may change, and the
+      // app may go, while nothing is being appended), and tell it whether
+      // upscaled video is playing here and on which screen: its window
+      // mentions a smaller display only while something is being watched
+      // on one.
       if (ticks++ % 4 === 0 || playing !== wasPlaying) {
         window.postMessage({ __vsr: "cfg", playing, screen: screenInfo() }, "*");
       }
       wasPlaying = playing;
-    }, 500);
+    }, 250);
   }
 
   window.__vsr = { status: () => Object.assign({}, stats) };

@@ -32,7 +32,7 @@ const MAX_BODY: usize = 256 << 20;
 /// "Active" in /status for this long after a fragment was upscaled.
 const ACTIVE_FOR: Duration = Duration::from_secs(5);
 /// Upscaled video counts as playing for this long after a page said so
-/// (pages repeat it every two seconds).
+/// (pages repeat it every second).
 pub const WATCHING_FOR: Duration = Duration::from_secs(5);
 
 pub fn start(shared: Arc<Shared>, engine: Arc<Engine>, port: u16) -> Result<(), String> {

@@ -17,7 +17,11 @@ touched). Checks that
   - the "RTX VSR" indicator sits in the video's top right corner when the
     app's setting is on (its picture loaded, although the page's content
     security policy forbids images and inline styles), and is absent when
-    it is off.
+    it is off,
+  - it is there only while upscaled video is playing: it fades out when the
+    video is paused or ends and back in when it plays again, it goes when
+    the app does, and it is not shown over the part of a stream that was
+    appended at the output size already (and so not upscaled).
 
 Usage:  ~/vsr-venv/bin/python spike/test_extension.py [path/to/rtx-vsr]
   needs: the Vivaldi Flatpak (com.vivaldi.Vivaldi), a built app
@@ -64,6 +68,9 @@ PAGE = r"""<!doctype html><meta charset=utf-8><title>vsr mse test</title>
   const R = window.__result = { segs: [], errors: [], events: {}, done: false };
   const q = new URLSearchParams(location.search);
   const piece = +q.get("piece") || 0, N = +q.get("n"), audio = q.get("audio") === "1";
+  // mix=K: segments after the K-th come from the rendition that is as large
+  // as the app's output, which the app leaves alone.
+  const mix = +q.get("mix") || 0;
   const v = document.getElementById("v");
   try {
     v.addEventListener("error", () => R.errors.push("video: " + (v.error && v.error.message)));
@@ -91,7 +98,8 @@ PAGE = r"""<!doctype html><meta charset=utf-8><title>vsr mse test</title>
       if (!piece || b !== sb) return append(b, buf);
       for (let o = 0; o < buf.byteLength; o += piece) await append(b, buf.slice(o, o + piece));
     }
-    const name = (s, i) => `chunk-stream${s}-${String(i).padStart(5, "0")}.m4s`;
+    const name = (s, i) =>
+      `${mix && !s && i > mix ? "hd/" : ""}chunk-stream${s}-${String(i).padStart(5, "0")}.m4s`;
     await feed(sb, "init-stream0.m4s");
     if (asb) await feed(asb, "init-stream1.m4s");
     // A headless window that loses focus gets "video-only background media
@@ -100,6 +108,7 @@ PAGE = r"""<!doctype html><meta charset=utf-8><title>vsr mse test</title>
       e.name === "AbortError" ? setTimeout(play, 100) : R.errors.push("play: " + e));
     play();
     for (let i = 1; i <= N; i++) {
+      if (mix && i === mix + 1) await feed(sb, "hd/init-stream0.m4s");
       await feed(sb, name(0, i));
       if (asb) await feed(asb, name(1, i));
       R.segs.push({ w: v.videoWidth, h: v.videoHeight,
@@ -109,17 +118,19 @@ PAGE = r"""<!doctype html><meta charset=utf-8><title>vsr mse test</title>
 
     // While a fragment is away being transformed the buffer must look busy,
     // refuse remove(), and abort() must cancel it cleanly.
-    const again = await (await fetch(name(0, 1))).arrayBuffer();
-    const before = Object.assign({}, R.events);
-    sb.appendBuffer(again);
-    try { sb.remove(0, 1); R.errors.push("remove() during an append did not throw"); }
-    catch (e) { if (e.name !== "InvalidStateError") R.errors.push("remove threw " + e.name); }
-    sb.abort();
-    if (sb.updating) R.errors.push("updating true after abort");
-    await new Promise((r) => setTimeout(r, 300));
-    R.abortEvents = { abort: (R.events.abort || 0) - (before.abort || 0),
-                      updateend: (R.events.updateend || 0) - (before.updateend || 0) };
-    await append(sb, again);          // usable again afterwards
+    if (!mix) {
+      const again = await (await fetch(name(0, 1))).arrayBuffer();
+      const before = Object.assign({}, R.events);
+      sb.appendBuffer(again);
+      try { sb.remove(0, 1); R.errors.push("remove() during an append did not throw"); }
+      catch (e) { if (e.name !== "InvalidStateError") R.errors.push("remove threw " + e.name); }
+      sb.abort();
+      if (sb.updating) R.errors.push("updating true after abort");
+      await new Promise((r) => setTimeout(r, 300));
+      R.abortEvents = { abort: (R.events.abort || 0) - (before.abort || 0),
+                        updateend: (R.events.updateend || 0) - (before.updateend || 0) };
+      await append(sb, again);          // usable again afterwards
+    }
 
     ms.endOfStream();
     R.buffered = []; for (let i = 0; i < v.buffered.length; i++) R.buffered.push([v.buffered.start(i), v.buffered.end(i)]);
@@ -131,18 +142,57 @@ PAGE = r"""<!doctype html><meta charset=utf-8><title>vsr mse test</title>
     const q2 = v.getVideoPlaybackQuality();
     R.frames = { total: q2.totalVideoFrames, dropped: q2.droppedVideoFrames };
     R.vsr = window.__vsr ? window.__vsr.status() : null;
-    // The indicator is placed by a timer; give it a moment.
+    // The indicator: there while upscaled video plays, and only then.
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const until = async (cond, ms) => {
+      const t = performance.now();
+      while (!cond() && performance.now() - t < ms) await sleep(20);
+      return !!cond();
+    };
     const find = () => document.querySelector("[data-rtx-vsr-indicator]");
-    const t1 = performance.now();
-    const shown = () => find() && find().style.display === "block" && find().complete;
-    while (q.get("mark") === "1" && !shown()
-           && performance.now() - t1 < 4000) await new Promise((r) => setTimeout(r, 100));
+    const look = () => {
+      const m = find(), c = m && getComputedStyle(m);
+      return c ? [+c.opacity, c.visibility] : [0, "hidden"];
+    };
+    const shown = () => look().join() === "0.7,visible" && find().complete;
+    const hidden = () => look().join() === "0,hidden";
+    const moving = () => !v.paused && !v.ended && v.readyState > 2;
+    const seek = async (t) => {
+      v.currentTime = t;
+      await until(() => !v.seeking && moving(), 5000);
+    };
+    const now = () => ({ moving: moving(), size: [v.videoWidth, v.videoHeight], t: v.currentTime });
+    if (q.get("mark") === "1") await until(shown, 4000);
     const m = find();
-    R.mark = m && m.style.display === "block" ? {
+    R.mark = m && shown() ? {
       picture: m.naturalWidth, opacity: getComputedStyle(m).opacity, shadow: getComputedStyle(m).boxShadow,
       left: m.offsetLeft, top: m.offsetTop, side: [m.offsetWidth, m.offsetHeight],
       video: [v.offsetLeft, v.offsetTop, v.clientWidth, v.clientHeight],
     } : null;
+    if (R.mark && q.get("gone") === "1") {
+      R.waiting = true;               // for the test to stop the app
+      await until(() => window.__go, 30000);
+      R.gone = Object.assign({ hidden: await until(hidden, 5000) }, now());
+    } else if (R.mark && mix) {
+      // Both parts play at the same size; only the first was upscaled.
+      await seek(2 * mix + 3);
+      await sleep(1000);              // longer than a seek keeps it away anyway
+      R.mix = { original: Object.assign({ hidden: hidden() }, now()) };
+      await seek(3);
+      R.mix.upscaled = Object.assign({ shown: await until(shown, 3000) }, now());
+    } else if (R.mark) {
+      const seen = [];
+      const sampler = setInterval(() => seen.push(look()[0]), 10);
+      v.pause();
+      R.mark.pauseHides = await until(hidden, 3000);
+      play();
+      R.mark.playShows = await until(shown, 3000);
+      clearInterval(sampler);
+      R.mark.fades = seen.some((o) => o > 0.05 && o < 0.65);
+      v.currentTime = v.duration - 1;
+      await until(() => v.ended, 6000);
+      R.mark.endHides = v.ended && await until(hidden, 3000);
+    }
   } catch (e) {
     R.errors.push(String(e && e.stack || e));
   }
@@ -152,17 +202,23 @@ PAGE = r"""<!doctype html><meta charset=utf-8><title>vsr mse test</title>
 """
 
 
-def make_site(dst):
+def make_stream(dst, size):
+    os.makedirs(dst, exist_ok=True)
     subprocess.run([
         imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
         "-i", os.path.join(HERE, "sample_720p.mp4"),
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
         "-map", "0:v:0", "-map", "1:a:0", "-shortest",
-        "-vf", "scale=640:360", "-c:v", "libx264", "-preset", "veryfast",
+        "-vf", "scale=" + size, "-c:v", "libx264", "-preset", "veryfast",
         "-profile:v", "high", "-bf", "3", "-g", "60", "-keyint_min", "60",
         "-sc_threshold", "0", "-c:a", "aac", "-b:a", "96k",
         "-f", "dash", "-seg_duration", "2", "-use_template", "1",
         "-use_timeline", "0", os.path.join(dst, "manifest.mpd")], check=True)
+
+
+def make_site(dst):
+    make_stream(dst, "640:360")
+    make_stream(os.path.join(dst, "hd"), "1280:720")   # the app's output size
     with open(os.path.join(dst, "index.html"), "w") as f:
         f.write(PAGE)
     n = len([f for f in os.listdir(dst) if f.startswith("chunk-stream0")])
@@ -214,7 +270,7 @@ def wait_http(url, timeout=60):
     raise RuntimeError(f"timeout waiting for {url}")
 
 
-async def run_page(cdp, url, timeout=120):
+async def run_page(cdp, url, timeout=120, when_waiting=None):
     # A new window: Vivaldi's default new tab never becomes scriptable headless.
     tid = (await cdp.call("Target.createTarget", {"url": url, "newWindow": True}))["targetId"]
     await asyncio.sleep(1.5)      # attach after the navigation has committed
@@ -225,12 +281,16 @@ async def run_page(cdp, url, timeout=120):
         res = json.loads(await cdp.evaluate(s, "JSON.stringify(window.__result || null)"))
         if res and res["done"]:
             break
+        if res and res.get("waiting") and when_waiting:
+            when_waiting()
+            when_waiting = None
+            await cdp.evaluate(s, "window.__go = true")
         await asyncio.sleep(0.5)
     await cdp.call("Target.closeTarget", {"targetId": tid})
     return res
 
 
-def check(label, res, n, expect_vsr, expect_mark=False):
+def check(label, res, n, expect_vsr, expect_mark=False, mix=0):
     # The app upscales to its configured 1280x720 (the headless window's
     # 800x600 screen is no display it knows, so there is no further cap).
     want = [1280, 720] if expect_vsr else [640, 360]
@@ -250,13 +310,31 @@ def check(label, res, n, expect_vsr, expect_mark=False):
         "playback advances": (res.get("currentTime") or 0) >= 2,
         "one updateend per append": res["events"].get("updateend", 0) >= res.get("appends", 1e9),
         "abort() -> abort + updateend": res.get("abortEvents") == {"abort": 1, "updateend": 1}
-                                        or not expect_vsr,
+                                        or not expect_vsr or mix,
         "hook present / vp9 steered": (res.get("hooked"), res.get("vp9")) == (expect_vsr, not expect_vsr),
         "every segment transformed": not expect_vsr
-                                     or (res["vsr"]["transformed"] >= n and res["vsr"]["passthrough"] == 0),
+                                     or (res["vsr"]["transformed"] >= n and res["vsr"]["passthrough"] == 0)
+                                     or (mix and (res["vsr"]["transformed"], res["vsr"]["passthrough"])
+                                         == (mix, n - mix)),
         "indicator in the top right corner" if expect_mark else "no indicator":
             bool(mark) and in_corner if expect_mark else not mark,
     }
+    full = [1280, 720]
+    if expect_mark and "gone" in res:
+        g = res["gone"]
+        checks["indicator goes with the app, video still playing"] = g["hidden"] and g["moving"]
+        print(f"  after the app stopped: {g}")
+    elif expect_mark and mix:
+        m = res.get("mix") or {"original": {}, "upscaled": {}}
+        o, u = m["original"], m["upscaled"]
+        checks["no indicator over the part that was not upscaled"] = (
+            o.get("hidden") and o.get("moving") and o.get("size") == full and o["t"] > 2 * mix)
+        checks["indicator back over the upscaled part"] = (
+            u.get("shown") and u.get("moving") and u.get("size") == full and u["t"] < 2 * mix)
+        print(f"  original part: {o}\n  upscaled part: {u}")
+    elif expect_mark:
+        checks["indicator fades out on pause and at the end, back in on play"] = bool(mark) and all(
+            mark.get(k) for k in ("pauseHides", "playShows", "fades", "endHides"))
     bad = [k for k, v in checks.items() if not v]
     print(f"{label}: size={res.get('size')} buffered={res.get('buffered')} "
           f"t={res.get('currentTime')} frames={res.get('frames')} vsr={res.get('vsr')} mark={mark}")
@@ -375,13 +453,26 @@ async def main():
             proxy = start_app(app, config, indicator=True)
             ok &= check("64 kB pieces + indicator ", await run_page(cdp, page + "&piece=65536&mark=1"),
                         n, True, expect_mark=True)
+
+            # 4. the second half of the stream is as large as the app's output
+            ok &= check("half upscaled, half not  ", await run_page(cdp, page + f"&mark=1&mix={n // 2}"),
+                        n, True, expect_mark=True, mix=n // 2)
             # the page was playing upscaled video until a moment ago, and said so
             watching = json.loads(wait_http(f"http://127.0.0.1:{PROXY_PORT}/status"))["watching"]
             print(f"app told that upscaled video is playing: {watching}")
             ok &= watching
+
+            st = json.loads(wait_http(f"http://127.0.0.1:{PROXY_PORT}/status"))
+
+            # 5. the app stops while its video is still playing
+            def stop_app():
+                proxy.terminate()
+                proxy.wait(timeout=10)
+            ok &= check("app stopped while playing", await run_page(cdp, page + "&mark=1&gone=1",
+                                                                    when_waiting=stop_app),
+                        n, True, expect_mark=True)
             await cdp.call("Browser.close")
 
-        st = json.loads(wait_http(f"http://127.0.0.1:{PROXY_PORT}/status"))
         print(f"app: {st['total_transforms']} segments, {st['total_frames']} frames, "
               f"last {st['last_in']} -> {st['last_out']} {st['last_mode']}, {st['fps'] or 0:.0f} fps")
     finally:
