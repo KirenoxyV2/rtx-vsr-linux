@@ -1,9 +1,9 @@
 # HANDOFF — rtx-vsr-linux on an RTX 2060 SUPER
 
-**Updated:** 2026-10-11, end of the session that made the indicator follow
-what is actually playing, gave it a fade, and animated the window's switches
-(Pop!_OS 24.04, GNOME/Wayland, driver 595.104.02, displays DP-1 2560×1440 +
-DP-2 1920×1200).
+**Updated:** 2026-10-11, end of the session that stopped upscaled video from
+freezing: fragments come back in parts, the mode follows measured speed frame
+by frame, one model is loaded at a time (Pop!_OS 24.04, GNOME/Wayland, driver
+595.104.02, displays DP-1 2560×1440 at 165 Hz + DP-2 1920×1200).
 **Branch:** `turing-and-mpv` (on top of `main` of github.com/akdnexpat/rtx-vsr-linux).
 Everything is committed; nothing is pushed.
 
@@ -15,8 +15,8 @@ Everything is committed; nothing is pushed.
 |-------|-------|
 | VSR on Turing | All modes load and run natively (`spike/probe_turing.py` 0–6 ok). |
 | mpv | **Working and installed.** `mpv/vsr.vpy` + `mpv/main.lua` in the stock Flathub mpv; `Alt+v` toggles, `Alt+q` cycles modes. Untouched this session. |
-| The app (`app/`) | **Working.** One Rust binary: the browser path's proxy (NVDEC → VSR → NVENC, all on the GPU, no Python), an iced window for it and a tray icon. Closing the window leaves it in the tray; *Start minimized* starts it there at login. Its switches slide and blend when they change (`app/src/toggle.rs`). Installed as `~/.local/bin/rtx-vsr`; the launcher and the login entry on this machine run `app/target/release/rtx-vsr`, the build itself. |
-| Browser extension | **Working with the app**, v0.3.0: no settings of its own any more besides the site list; shows the "RTX VSR" indicator (`extension/icons/indicator.png`, 70 % opaque) only while upscaled frames are playing — it fades out on pause, at the end, while buffering, over parts that were not upscaled, and when the app is off or gone — and tells the app when upscaled video is playing and on which screen. Tested in headless Vivaldi and at the buffering level on YouTube. |
+| The app (`app/`) | **Working.** One Rust binary: the browser path's proxy (NVDEC → VSR → NVENC, all on the GPU, no Python), an iced window for it and a tray icon. An upscaled fragment is handed back in parts, the first after about half a second; the VSR mode is the best one that is measured to be faster than the video plays, and a player that is running dry gets LOW until it has 2 s buffered again (`docs/DESIGN.md` §9g, *Keeping up with playback*). Closing the window leaves it in the tray; *Start minimized* starts it there at login. Its switches slide and blend when they change (`app/src/toggle.rs`). Installed as `~/.local/bin/rtx-vsr`; the launcher and the login entry on this machine run `app/target/release/rtx-vsr`, the build itself. |
+| Browser extension | **Working with the app**, v0.3.0: appends each part of a fragment as it arrives and tells the app where the playhead is; no settings of its own any more besides the site list; shows the "RTX VSR" indicator (`extension/icons/indicator.png`, 70 % opaque) only while upscaled frames are playing — it fades out on pause, at the end, while buffering, over parts that were not upscaled, and when the app is off or gone — and tells the app when upscaled video is playing and on which screen. Tested in headless Vivaldi and at the buffering level on YouTube. |
 | Python proxy | **Removed** (`proxy/`, and `spike/test_segment_mse.py`, `test_downshift.py`, `test_policy.py`, `test_proxy_youtube.py`). `spike/test_app_proxy.py` and the app's unit tests cover what they did. |
 | GStreamer (M2), Chromium patch (M4) | Not started. |
 
@@ -25,20 +25,21 @@ Design rationale and the pitfalls behind each piece: `docs/DESIGN.md` §5C
 
 ## 2. What you still have to do by hand
 
-At the start of this session the app was running on port 8730 from
-`app/target/release`, Vivaldi had been started through the connected launcher,
-and a login entry existed, so the first steps of the previous handoff are done.
+The new build is in place (`app/target/release/rtx-vsr`, which the launcher
+and the login entry run, and `~/.local/bin/rtx-vsr`). Neither the app nor
+Vivaldi was running when this session ended.
 
-1. **Start the app again, then restart the browser once.** The app was not
-   running any more when this session ended (it was not stopped on purpose).
-   Starting the new build refreshes the extension files of a connected
-   browser; the browser loads them (the indicator's new behaviour) at its
-   next start.
+1. **Start the app first, then the browser.** The extension changed with the
+   app (parts, the playhead's position): starting the app refreshes the
+   extension files of a connected browser, and the browser loads them when
+   it starts. A browser that was already running keeps the old extension,
+   which still works with the new app but gets whole fragments, as before.
 2. Not checked: whether the hand-loaded "RTX VSR Local Upscaler" is still in
    `vivaldi://extensions`. If it is, remove it (otherwise both copies relay
    every segment); `~/Documents/extension` can go with it.
-3. Switch on *Show RTX VSR indicator* if it is not, and watch it on a real
-   video: pause, seek, let it buffer, switch *Upscale video* off and on.
+3. **Watch a real YouTube video on ULTRA**, which is what froze before:
+   start, seek around, 1080p60, double speed. The tests play a local stream
+   like a player does; YouTube's own player has not been watched.
 
 ## 3. This machine
 
@@ -82,23 +83,29 @@ install/install_mpv.sh        # builds ~/vsr-venv-py313, links the mpv script, s
 
 ## 4. Tests
 
-The first four pass at handoff; `test_vpy.py` and `install_mpv.sh` were not
-run again this session (nothing they cover changed). `test_extension.py` now
-also pauses, resumes and ends the video, stops the app under it, and plays a
-stream whose second half is already as large as the app's output, checking
-the indicator each time.
+The first four pass at handoff; `test_tray.py`, `test_vpy.py` and
+`install_mpv.sh` were not run this session (nothing they cover changed).
+`test_playback.py` is new: it plays 5 s segments (720p60, 1080p30, 1080p60,
+1080p30 at double speed) through the extension with the app on ULTRA at
+2560×1440, the page behaving like a player, and fails if the first frame
+takes more than 2 s, a seek into unbuffered video more than 3.5 s, or
+playback stands still for more than 0.25 s. The build before this session
+fails all three. With `--window` it runs on the desktop and also counts
+frames that reach the screen late; `--off` gives the browser's own figures
+to compare with, `--play 60 --ahead 30` a longer session.
 
 ```bash
-(cd app && cargo test && cargo clippy --all-targets)   # 18 unit tests
-~/vsr-venv/bin/python spike/test_app_proxy.py          # proxy vs. MSE: timing, colour, caps
+(cd app && cargo test && cargo clippy --all-targets)   # 22 unit tests
+~/vsr-venv/bin/python spike/test_app_proxy.py          # proxy vs. MSE: timing, colour, caps, parts
 ~/vsr-venv/bin/python spike/test_extension.py          # extension + app in headless Vivaldi
+~/vsr-venv/bin/python spike/test_playback.py           # no stalls, quick start and seek (port 8747)
 ~/vsr-venv/bin/python spike/test_tray.py               # tray icon, close to tray, start minimized
 ~/vsr-venv/bin/python -W ignore spike/test_vpy.py      # mpv filter colour math + fps
 install/install_mpv.sh                                 # ends with a real mpv run
 ```
 
-The two end-to-end tests start their own copy of the app on ports 8742 and
-8744 with a throwaway settings directory, so they run next to yours.
+The end-to-end tests start their own copy of the app on ports 8742, 8744
+and 8747 with a throwaway settings directory, so they run next to yours.
 `test_extension.py` also uses a page server on 8731 and DevTools on 9333,
 starts the browser with the command line of the launcher override that
 `rtx-vsr --connect` writes (into a throwaway home), and cleans up after
@@ -165,6 +172,11 @@ running app's window. Wayland's socket is in the real one, hence XWayland.)
   makes the running shell fetch and load it (it asks on screen first).
 - Output sizes need only be even with nvidia-vfx 0.2.0.0, and fractional
   factors work; the model stops at 4×.
+- **VSR models that are loaded together keep their GPU memory** after they
+  are dropped; one at a time they give it all back. The app holds one.
+- **A headless browser shows no frames**: stalls, starts and seeks can be
+  measured there, frames that reach the screen late only with `--window`.
+  On the 165 Hz display 2–4 % of frames are late with upscaling off, too.
 
 ## 6. What to do next
 
@@ -213,7 +225,8 @@ running app's window. Wayland's socket is in the real one, hence XWayland.)
   | ULTRA | 1080p→4K | 31.5 | 874 MB |
 
 - Whole app pipeline on the same card, output 1440p: 720p MEDIUM 7.5 ms/frame,
-  HIGH 10.9, ULTRA 15.7; 1080p MEDIUM 10.9, HIGH 19.5, ULTRA 30.4.
+  HIGH 10.9, ULTRA 15.7; 1080p MEDIUM 10.9, HIGH 19.5, ULTRA 30.4. (Measured
+  before the encoder ran alongside the model; not measured again since.)
 - **Custom mpv build** (only if the Flatpak is not an option): mpv 0.41.0
   with `-Dvapoursynth=enabled`; the pip VapourSynth wheel lacks
   `vapoursynth-script.pc`, which must be synthesised

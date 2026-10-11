@@ -189,6 +189,7 @@ the same things: `rtx-vsr --headless`, `--install-runtime`, `--browsers`,
 (cd app && cargo test)                                  # MP4, sizing, launcher patching, …
 ~/vsr-venv/bin/python spike/test_app_proxy.py           # the app's proxy against what MSE needs
 ~/vsr-venv/bin/python spike/test_extension.py           # extension + app in a headless browser
+~/vsr-venv/bin/python spike/test_playback.py            # does it play without stalling? (--window: on your screen)
 ```
 
 mpv gives the better picture path (no re-encode); the app is for staying in

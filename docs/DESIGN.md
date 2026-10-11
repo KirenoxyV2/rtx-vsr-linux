@@ -525,8 +525,8 @@ What it took, in the order the questions came up:
   display that matches and never upscales past it (fit inside
   `min(chosen, that display)`, at most the model's 4×).
 - **Two automatic step-downs**: the VRAM estimate of §9b, checked when a model
-  is loaded, and speed — two fragments in a row processed slower than they
-  play lower the mode by one until the stream goes idle.
+  is loaded, and speed, measured on the frames themselves (see *Keeping up
+  with playback* below).
 - **Upscaled video is several times the bytes** the player budgeted for, and
   Chromium's SourceBuffer holds 150 MB. When the real append hits
   `QuotaExceededError` the hook keeps `updating` true and retries each second,
@@ -537,6 +537,64 @@ What it took, in the order the questions came up:
 - **Only extensions may use the endpoint.** A request with a web page's
   `Origin`, or a foreign `Host`, gets 403: a site must not be able to drive
   the GPU of whoever visits it.
+
+**Keeping up with playback** (later on 2026-10-11, after video kept freezing
+in real use). The first version answered a fragment when all of it was done
+and judged its speed fragment by fragment. With YouTube's 5 s fragments that
+is seconds of nothing at every start and seek, and a mode that is too slow is
+only left after the player has run dry twice. `spike/test_playback.py` plays
+such streams through the extension the way a player does (a few seconds
+buffered ahead, a seek into video that is not there yet) and measures it.
+What changed:
+
+- **A fragment comes back in parts.** `POST /transform?parts=1` answers as
+  soon as the first 0.4 s of video are encoded, and names the fragment in
+  `X-VSR-Next`; `POST /transform/next?job=` returns what has been finished
+  since (a part is cut every 250 ms of work), `POST /transform/cancel?job=`
+  says the rest is not wanted. The hook appends each part to the real buffer
+  as it comes, behind the page's back: the page still sees one append,
+  `updating` throughout, and one `updateend` when the last part is in.
+  `abort()` (a seek) cancels the fragment in the app too, so the GPU is not
+  kept busy with frames nobody will see.
+- **The player says where it is**, with the fragment and again with each
+  request for a part: `lead`, the seconds buffered in front of the playhead
+  (not said while paused), `behind`, the seconds of this fragment nobody is
+  waiting to see (the playhead is past them after a seek into its middle),
+  and `rate`. Frames behind the playhead are made with LOW, and so is
+  everything while less than 1 s is buffered, until there are 2 s again:
+  a player about to run dry needs frames now more than it needs them good.
+- **The mode is the best one that is faster than the video plays, measured
+  while it runs.** Every ten frames, what a frame took is compared with what
+  it may take (its duration, less 15 %, divided by the playback rate). Too
+  slow and the next frame is made one mode down, in the middle of the
+  fragment. A miss by less than a quarter has to happen twice, and that mode
+  gets another chance two minutes later: something else may have held the
+  GPU up. The measurements are kept per input size, output size and mode for
+  as long as the app runs, so the next video starts in the mode that fits.
+- **One model is loaded at a time.** Models that are loaded together do not
+  give their memory back when they are dropped (the SDK's doing); loaded one
+  after the other they do. Swapping takes about a tenth of a second, which
+  the hurry rule's two thresholds keep from happening frame by frame.
+- **The encoder works while the model does.** NVENC is hardware of its own.
+  It has two input and two output buffers now: `submit` starts a picture and
+  returns, the model's work on the next picture is queued, and only then is
+  the encoded one collected.
+
+Measured in a window on the 165 Hz display, ULTRA asked for, output
+2560×1440 (first frame / a seek into unbuffered video / stood still during
+10 s of playback):
+
+| Stream | Before | After |
+|--------|--------|-------|
+| 1080p30 | 4.9 s / 6.0 s / 0 s, ULTRA | 0.5 s / 0.9 s / 0 s, ULTRA |
+| 720p60 | 5.0 s / 6.8 s / 0 s, ULTRA | 0.4 s / 1.3 s / 0 s, ULTRA |
+| 1080p60 | 9.4 s / 7.5 s / 3.0 s, HIGH | 0.4 s / 1.3 s / 0 s, MEDIUM |
+
+Over a minute of playback with 30 s buffered ahead nothing stood still, the
+app's GPU memory stayed where it was (0.6–1 GB), and frames reached the
+screen late (by more than half a frame) as often as with upscaling switched
+off: 2–4 % of them, which is this browser on this display. The GPU is
+92–100 % busy while it works on ULTRA.
 
 **Getting the extension into the browser without the user doing it.** A
 running browser offers nothing: remote debugging is off (and refused for the
@@ -613,8 +671,8 @@ one and only then falls back to what it did before there was an icon: a
 minimised window.
 
 Open: long sessions on YouTube in a normal window (quality switches, ads,
-live), VP9 through NVDEC (Turing
-decodes it) so that steering to H.264 becomes optional.
+live) — `test_playback.py` plays a local stream, not YouTube's player; VP9
+through NVDEC (Turing decodes it) so that steering to H.264 becomes optional.
 
 ## 10. References
 
