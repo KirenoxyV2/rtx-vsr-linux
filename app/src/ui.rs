@@ -15,7 +15,7 @@ use iced::futures::{Stream, StreamExt};
 
 use iced::overlay::menu;
 use iced::widget::{
-    button, column, container, pick_list, progress_bar, row, rule, scrollable, text, toggler,
+    button, column, container, pick_list, progress_bar, row, rule, scrollable, text,
 };
 use iced::window;
 use iced::{
@@ -30,6 +30,7 @@ use crate::engine::runtime;
 use crate::gpu::nvml::{self, GpuInfo};
 use crate::server::WATCHING_FOR;
 use crate::state::{Runtime, Settings, Shared, Stats, APP_ID};
+use crate::toggle::Toggle;
 
 const GREEN: Color = Color::from_rgb8(0x76, 0xb9, 0x00);
 const BACKGROUND: Color = Color::from_rgb8(0x1e, 0x1e, 0x1e);
@@ -509,7 +510,7 @@ impl App {
             ))
             .push(switch(
                 "Show RTX VSR indicator",
-                "Marks the top right corner of a video while it is being shown upscaled.",
+                "Marks the top right corner of a video while it is playing upscaled.",
                 self.settings.indicator,
                 Message::Indicator,
             ));
@@ -743,7 +744,7 @@ fn switch<'a>(
         column![text(label).size(14), hint(explanation)]
             .spacing(2)
             .width(Fill),
-        toggler(on).on_toggle(message).size(22),
+        Toggle::new(on, message).size(22.0),
     ]
     .spacing(12)
     .align_y(Center)

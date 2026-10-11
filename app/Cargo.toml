@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/akdnexpat/rtx-vsr-linux"
 
 [dependencies]
-iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "x11", "wayland"] }
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "x11", "wayland", "advanced"] }
 winit = "0.30"
 ksni = { version = "0.3", features = ["blocking"] }
 libloading = "0.8"

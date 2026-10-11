@@ -9,6 +9,7 @@ mod gpu;
 mod instance;
 mod server;
 mod state;
+mod toggle;
 mod tray;
 mod ui;
 
