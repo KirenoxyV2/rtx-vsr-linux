@@ -1,8 +1,9 @@
 # HANDOFF — rtx-vsr-linux on an RTX 2060 SUPER
 
-**Updated:** 2026-10-11, end of the session that gave the app a tray icon,
-a plainer window and the new indicator (Pop!_OS 24.04, GNOME/Wayland, driver
-595.104.02, displays DP-1 2560×1440 + DP-2 1920×1200).
+**Updated:** 2026-10-11, end of the session that made the indicator follow
+what is actually playing, gave it a fade, and animated the window's switches
+(Pop!_OS 24.04, GNOME/Wayland, driver 595.104.02, displays DP-1 2560×1440 +
+DP-2 1920×1200).
 **Branch:** `turing-and-mpv` (on top of `main` of github.com/akdnexpat/rtx-vsr-linux).
 Everything is committed; nothing is pushed.
 
@@ -14,8 +15,8 @@ Everything is committed; nothing is pushed.
 |-------|-------|
 | VSR on Turing | All modes load and run natively (`spike/probe_turing.py` 0–6 ok). |
 | mpv | **Working and installed.** `mpv/vsr.vpy` + `mpv/main.lua` in the stock Flathub mpv; `Alt+v` toggles, `Alt+q` cycles modes. Untouched this session. |
-| The app (`app/`) | **Working.** One Rust binary: the browser path's proxy (NVDEC → VSR → NVENC, all on the GPU, no Python), an iced window for it and a tray icon. Closing the window leaves it in the tray; *Start minimized* starts it there at login. Installed as `~/.local/bin/rtx-vsr`; not started, not connected to any browser, not in autostart — those are yours to switch on. |
-| Browser extension | **Working with the app**, v0.3.0: no settings of its own any more besides the site list; shows the "RTX VSR" indicator (`extension/icons/indicator.png`, 70 % opaque) and tells the app when upscaled video is playing and on which screen. Tested in headless Vivaldi and at the buffering level on YouTube. |
+| The app (`app/`) | **Working.** One Rust binary: the browser path's proxy (NVDEC → VSR → NVENC, all on the GPU, no Python), an iced window for it and a tray icon. Closing the window leaves it in the tray; *Start minimized* starts it there at login. Its switches slide and blend when they change (`app/src/toggle.rs`). Installed as `~/.local/bin/rtx-vsr`; the launcher and the login entry on this machine run `app/target/release/rtx-vsr`, the build itself. |
+| Browser extension | **Working with the app**, v0.3.0: no settings of its own any more besides the site list; shows the "RTX VSR" indicator (`extension/icons/indicator.png`, 70 % opaque) only while upscaled frames are playing — it fades out on pause, at the end, while buffering, over parts that were not upscaled, and when the app is off or gone — and tells the app when upscaled video is playing and on which screen. Tested in headless Vivaldi and at the buffering level on YouTube. |
 | Python proxy | **Removed** (`proxy/`, and `spike/test_segment_mse.py`, `test_downshift.py`, `test_policy.py`, `test_proxy_youtube.py`). `spike/test_app_proxy.py` and the app's unit tests cover what they did. |
 | GStreamer (M2), Chromium patch (M4) | Not started. |
 
@@ -24,19 +25,20 @@ Design rationale and the pitfalls behind each piece: `docs/DESIGN.md` §5C
 
 ## 2. What you still have to do by hand
 
-1. **Stop the old proxy.** A `python proxy/vsr_proxy.py` was still listening
-   on port 8730 when this session ended; the app needs that port and says so
-   in its window if it cannot have it.
-2. Run `rtx-vsr`. The NVIDIA runtime is found in `~/vsr-venv`, so there is
-   nothing to download on this machine.
-3. In the window: **Browsers → Connect Vivaldi**, then restart Vivaldi. After
-   that, remove the hand-loaded "RTX VSR Local Upscaler" from
-   `vivaldi://extensions` (otherwise both copies relay every segment), and
-   `~/Documents/extension` can go.
-4. Optional: *Start at login*, *Start minimized*, *Show RTX VSR indicator*.
-5. A browser that is already connected has to be restarted once to load the
-   extension that came with this session's build (new indicator, the
-   "playing" reports behind the window's note about a smaller display).
+At the start of this session the app was running on port 8730 from
+`app/target/release`, Vivaldi had been started through the connected launcher,
+and a login entry existed, so the first steps of the previous handoff are done.
+
+1. **Start the app again, then restart the browser once.** The app was not
+   running any more when this session ended (it was not stopped on purpose).
+   Starting the new build refreshes the extension files of a connected
+   browser; the browser loads them (the indicator's new behaviour) at its
+   next start.
+2. Not checked: whether the hand-loaded "RTX VSR Local Upscaler" is still in
+   `vivaldi://extensions`. If it is, remove it (otherwise both copies relay
+   every segment); `~/Documents/extension` can go with it.
+3. Switch on *Show RTX VSR indicator* if it is not, and watch it on a real
+   video: pause, seek, let it buffer, switch *Upscale video* off and on.
 
 ## 3. This machine
 
@@ -81,7 +83,10 @@ install/install_mpv.sh        # builds ~/vsr-venv-py313, links the mpv script, s
 ## 4. Tests
 
 The first four pass at handoff; `test_vpy.py` and `install_mpv.sh` were not
-run again this session (nothing they cover changed).
+run again this session (nothing they cover changed). `test_extension.py` now
+also pauses, resumes and ends the video, stops the app under it, and plays a
+stream whose second half is already as large as the app's output, checking
+the indicator each time.
 
 ```bash
 (cd app && cargo test && cargo clippy --all-targets)   # 18 unit tests
@@ -101,15 +106,20 @@ itself. `test_tray.py` (port 8745) runs the app under XWayland, where a
 script can see and close windows, and plays the desktop's tray over D-Bus;
 the app's windows show up on screen for a moment while it runs.
 
-To look at the window without touching your own settings or launchers:
+To look at the window without touching your own settings, launchers or a
+copy of the app that is running:
 
 ```bash
+mkdir -p /tmp/x/run
+WAYLAND_DISPLAY= XDG_RUNTIME_DIR=/tmp/x/run \
 XDG_CONFIG_HOME=/tmp/x/config XDG_DATA_HOME=/tmp/x/data \
   app/target/release/rtx-vsr --port 8743 --screenshot /tmp/x/window.png
 ```
 
 (`--screenshot` saves a picture of the whole panel and quits; it is not in
-`--help`.)
+`--help`. The runtime directory holds the socket a second launch finds the
+first one through: without one of its own, this would only bring up the
+running app's window. Wayland's socket is in the real one, hence XWayland.)
 
 ## 5. Traps found so far
 
@@ -141,6 +151,12 @@ XDG_CONFIG_HOME=/tmp/x/config XDG_DATA_HOME=/tmp/x/data \
   (`WAYLAND_DISPLAY=` in the app's environment) with `xwininfo`/`xprop` and a
   `WM_DELETE_WINDOW` message for the close button, and on Wayland by tracing
   the protocol (`WAYLAND_DEBUG=1`).
+- **A switch's animation can be watched from a script** under XWayland:
+  `XGetImage` on the app's window returns its pixels, fast enough to see the
+  frames in between. The switches were checked that way (flipped through
+  the tray's menu); there is no test for it in the repository.
+- **Media events do not bubble**, but a capturing listener on `document`
+  gets them; the indicator relies on that for `pause`, `playing`, `waiting`.
 - **ksni does not call `watcher_online` for a tray that is already there** at
   start, only for one that appears later; the app assumes a tray until
   `watcher_offline` says otherwise.
@@ -155,9 +171,11 @@ XDG_CONFIG_HOME=/tmp/x/config XDG_DATA_HOME=/tmp/x/data \
 1. **Use it for real**: a long YouTube session in a normal window — seeking,
    quality switches, ads, live streams, a video dragged from one display to
    the other. Watch the window's "Last upscaled" line and the indicator.
-2. **Look at the tray icon and the window with your own eyes**: the tests
-   prove the behaviour, not the looks. The icon is the green app mark at
-   64 px, scaled by the panel.
+2. **Look at the tray icon, the window and the indicator's fade with your
+   own eyes**: the tests prove the behaviour, not the looks. The icon is
+   the green app mark at 64 px, scaled by the panel; the indicator fades
+   over 250 ms and the switches travel in 180 ms (`FADE_MS` in
+   `extension/inject.js`, `TRAVEL` in `app/src/toggle.rs`).
 3. **VP9 through NVDEC** (Turing decodes it): the extension could then stop
    steering players to H.264, which caps YouTube sources at 1080p.
 4. **Packaging**: a release binary on GitHub, or a Flatpak, so that building

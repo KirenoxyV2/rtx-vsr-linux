@@ -553,20 +553,52 @@ same switch; a launcher the user wrote is left alone.
 `spike/test_extension.py` starts the browser with exactly the override's
 command line.
 
-**The indicator.** Whether a video is showing upscaled frames is read from
-the decoder, not assumed: the hook remembers the output sizes the app
-returned for a stream, and a `<video>` playing that MediaSource whose
-`videoWidth × videoHeight` is one of them is showing them. The mark is an
-`<img>` of `extension/icons/indicator.png` at 70 % opacity (a web-accessible
+**The indicator** is shown while upscaled frames are playing, and only then.
+Whether a video is showing upscaled frames is read from the decoder, not
+assumed: the hook remembers the output sizes the app returned for a stream,
+and a `<video>` playing that MediaSource whose `videoWidth × videoHeight` is
+one of them is showing them. Size alone is not enough where an original can
+be as large as the output (1080p video on a 1080p-class display is left
+alone, 720p is upscaled to the same 1920×1080, and a player moves between
+the two by itself). So the hook also reads each fragment's place on the
+timeline from its `moof` (`tfdt` and the `trun` sample times, with the
+track's timescale, edit list and `trex` defaults from the init segment, plus
+the buffer's `timestampOffset`) and keeps, per SourceBuffer, the stretches
+that upscaled video was appended for; a later append, upscaled or not,
+replaces what was there for its stretch, as it does in the buffer. The
+video's `currentTime` has to be in one of them. Notes are taken when the
+real append happens, not when the app answers, so an aborted append leaves
+none. If a fragment's times cannot be read (or the buffer is in `sequence`
+mode), that stream falls back to sizes alone, forgetting a size as soon as
+an original of that size is appended; a stream the hook stops intercepting
+forgets everything.
+
+"Playing" means not paused, not ended and `readyState` above
+HAVE_CURRENT_DATA, which also covers buffering stalls and seeks. The
+video's own events (caught on `document` in the capture phase, since they
+do not bubble) make the mark react at once; a 250 ms timer sees the rest.
+The app's settings are asked for every second, and no answer counts as
+"not upscaling": the mark goes when the app does, although upscaled frames
+may still be in the buffer.
+
+The mark is an `<img>` of `extension/icons/indicator.png` (a web-accessible
 resource, which a page's `img-src` does not apply to; styled through style
 properties, never a style attribute) placed in the picture's top right corner
 inside the video's offset parent, which keeps it under the player's own
-controls and inside whatever goes fullscreen.
+controls and inside whatever goes fullscreen. It stays in the page once it
+has been shown and fades between 70 % and 0 opacity over 250 ms with a CSS
+transition; `visibility` is part of the same transition, so the element is
+hidden outright once it has faded out. A mark whose video has left the page
+is removed.
 
 **The window** is an iced daemon with one window, software-rendered
 (tiny-skia): a settings panel does not need a second GPU context. A second
 launch opens a new window instead of trying to raise the old one, which
-Wayland does not allow.
+Wayland does not allow. Its switches are a widget of the app's own
+(`app/src/toggle.rs`), because iced's toggler jumps: the knob slides and
+the colours blend over 180 ms, driven by the redraw events of the frames in
+between, whoever changed the value (a click, the tray's menu). At rest it
+is drawn from iced's own toggler style.
 
 **The tray icon** is a StatusNotifierItem (the `ksni` crate, pure Rust over
 D-Bus, so no GTK or libappindicator to link). While the desktop has a
